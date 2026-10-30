@@ -1,0 +1,75 @@
+# Rust / Cargo build artifacts
+/src-tauri/target/
+**/target/
+**/*.rs.bk
+
+# Standalone binary distribution directory & executables
+/RustTerm/*.exe
+/RustTerm/*.dll
+/RustTerm/RustTerm.exe
+*.exe
+*.dll
+*.pdb
+*.msi
+
+# Node & Frontend dependencies & bundles
+node_modules/
+/dist/
+dist-ssr/
+*.local
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+out.log
+err.log
+
+# Private keys, certificates, vault storage, and credentials
+vault_keys/
+**/vault_keys/
+*.ppk
+*.pem
+*.key
+*.pub
+*.pkcs12
+*.pfx
+passphrases.txt
+id_rsa*
+id_ed25519*
+id_ecdsa*
+id_dsa*
+rustterm_backup_*.json
+rustterm_vault_*.json
+*.backup.json
+*.backup.js
+*.backup.*
+
+# Environment files
+.env
+.env.*
+*.env
+
+# Scratch scripts & temporary test artifacts
+scratch/
+scratch_*
+*.tmp
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor & IDE settings
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
