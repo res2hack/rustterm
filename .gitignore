@@ -11,6 +11,8 @@
 *.dll
 *.pdb
 *.msi
+*.zip
+*.tar.gz
 
 # Node & Frontend dependencies & bundles
 node_modules/
