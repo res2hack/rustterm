@@ -1731,6 +1731,11 @@ body {
 }
 
 /* Dual-Pane SFTP Modal Styles */
+.modal-content.modal-sm {
+  width: 92vw;
+  max-width: 420px;
+}
+
 .modal-content.modal-md {
   width: 92vw;
   max-width: 540px;
@@ -1788,6 +1793,55 @@ body {
   font-size: 0.75rem;
   color: var(--text-dim);
   margin-top: 2px;
+}
+
+.sftp-sudo-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #cbd5e1;
+  font-size: 0.76rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.16s ease;
+}
+
+.sftp-sudo-toggle:hover:not(:disabled) {
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.45);
+  color: #fde68a;
+}
+
+.sftp-sudo-toggle.active {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.24), rgba(234, 88, 12, 0.22));
+  border-color: rgba(251, 191, 36, 0.65);
+  color: #fbbf24;
+  box-shadow: 0 0 12px rgba(245, 158, 11, 0.2);
+}
+
+.sftp-sudo-toggle:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.status-badge-small.sudo {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fbbf24;
+  border: 1px solid rgba(251, 191, 36, 0.45);
+}
+
+.sftp-sudo-pw-error {
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: rgba(239, 68, 68, 0.14);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #fca5a5;
+  font-size: 0.78rem;
 }
 
 .status-badge-small {

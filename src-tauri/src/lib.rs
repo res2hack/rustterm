@@ -117,8 +117,18 @@ async fn sftp_connect(
     state: State<'_, AppState>,
     sftp_session_id: String,
     host_config: HostConfig,
+    use_sudo: Option<bool>,
+    sudo_password: Option<String>,
 ) -> Result<String, String> {
-    state.sftp.connect(sftp_session_id, host_config).await
+    state
+        .sftp
+        .connect(
+            sftp_session_id,
+            host_config,
+            use_sudo.unwrap_or(false),
+            sudo_password,
+        )
+        .await
 }
 
 #[tauri::command]

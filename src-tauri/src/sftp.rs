@@ -162,6 +162,8 @@ pub struct ActiveSftpSession {
     pub backend: ActiveSftpBackend,
     pub host: HostConfig,
     pub current_dir: String,
+    pub use_sudo: bool,
+    pub sudo_password: Option<String>,
 }
 
 #[derive(Default)]
@@ -169,6 +171,23 @@ pub struct SftpManager {
     sessions: Arc<Mutex<HashMap<String, ActiveSftpSession>>>,
     watches: Arc<Mutex<HashMap<String, ActiveFileWatch>>>,
     cancel_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+}
+
+async fn disconnect_sftp_backend(backend: ActiveSftpBackend, sftp_session_id: &str) {
+    match backend {
+        ActiveSftpBackend::Russh { sftp, session } => {
+            let _ = sftp.close().await;
+            let _ = session
+                .disconnect(russh::Disconnect::ByApplication, "", "")
+                .await;
+            println!("[RustTerm SFTP] Disconnected russh session {}", sftp_session_id);
+        }
+        ActiveSftpBackend::Ssh2 { sess } => {
+            let s = sess.lock();
+            let _ = s.disconnect(None, "SFTP closed", None);
+            println!("[RustTerm SFTP] Disconnected ssh2 session {}", sftp_session_id);
+        }
+    }
 }
 
 pub async fn establish_sftp_russh(
@@ -186,6 +205,141 @@ pub async fn establish_sftp_russh(
     let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
         .await
         .map_err(|e| format!("Failed to initialize SFTP session: {}", e))?;
+    sftp.set_timeout(60);
+    Ok((sftp, session))
+}
+
+fn format_sudo_failure_detail(raw_stderr: &str, exit_code: Option<u32>) -> String {
+    let cleaned = raw_stderr
+        .replace("__RUSTTERM_PW__", "")
+        .replace("__RUSTTERM_OK__", "")
+        .replace("__RUSTTERM_NO_SFTP_SERVER__", "")
+        .trim()
+        .to_string();
+    let lower = cleaned.to_lowercase();
+
+    if lower.contains("sorry, try again")
+        || lower.contains("incorrect password")
+        || lower.contains("authentication failure")
+        || lower.contains("no password was provided")
+    {
+        return "SUDO_PASSWORD_INVALID: Incorrect sudo password.".to_string();
+    }
+    if lower.contains("a password is required") {
+        return "SUDO_PASSWORD_REQUIRED: Sudo password required for this host.".to_string();
+    }
+    if lower.contains("not in the sudoers") || lower.contains("may not run sudo") {
+        return format!("Sudo permission denied on remote host: {}", cleaned);
+    }
+    if cleaned.is_empty() {
+        format!(
+            "Failed to start SFTP server as sudo (exit code: {})",
+            exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )
+    } else {
+        format!("Sudo SFTP error: {}", cleaned)
+    }
+}
+
+pub async fn establish_sftp_russh_sudo(
+    host: &HostConfig,
+    sudo_password: Option<&str>,
+) -> Result<(russh_sftp::client::SftpSession, russh::client::Handle<RusshClientHandler>), String> {
+    let session = establish_authenticated_russh_session(host).await?;
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("Failed to open session channel for Sudo SFTP: {}", e))?;
+
+    let sudo_cmd = concat!(
+        "S=\"\"; ",
+        "for p in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/lib/sftp-server /usr/sbin/sftp-server; do ",
+        "if [ -x \"$p\" ]; then S=\"$p\"; break; fi; ",
+        "done; ",
+        "if [ -z \"$S\" ]; then S=$(command -v sftp-server 2>/dev/null || true); fi; ",
+        "if [ -z \"$S\" ] || [ ! -x \"$S\" ]; then ",
+        "printf '__RUSTTERM_NO_SFTP_SERVER__\\n' >&2; exit 127; ",
+        "fi; ",
+        "exec sudo -S -p '__RUSTTERM_PW__' sh -c 'printf \"__RUSTTERM_OK__\\n\" >&2; exec \"$1\"' _ \"$S\""
+    );
+
+    channel
+        .exec(true, sudo_cmd)
+        .await
+        .map_err(|e| format!("Failed to execute sudo sftp-server: {}", e))?;
+
+    let pw_prompt = "__RUSTTERM_PW__";
+    let ok_marker = "__RUSTTERM_OK__";
+    let no_srv_marker = "__RUSTTERM_NO_SFTP_SERVER__";
+    let mut stderr_acc = String::new();
+    let mut pw_cursor = 0usize;
+    let mut pw_attempts = 0u8;
+    let mut exit_code: Option<u32> = None;
+
+    let handshake = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
+                    if stderr_acc.len() < 8192 {
+                        stderr_acc.push_str(&String::from_utf8_lossy(&data));
+                    }
+                    if stderr_acc.contains(no_srv_marker) {
+                        let _ = channel.close().await;
+                        return Err("SFTP server binary (sftp-server) not found on remote host. Install openssh-sftp-server.".to_string());
+                    }
+                    if stderr_acc.contains(ok_marker) {
+                        return Ok(());
+                    }
+                    while let Some(rel_idx) = stderr_acc[pw_cursor..].find(pw_prompt) {
+                        pw_cursor += rel_idx + pw_prompt.len();
+                        if pw_attempts == 0 {
+                            if let Some(pw) = sudo_password {
+                                pw_attempts += 1;
+                                let payload = format!("{}\n", pw);
+                                channel
+                                    .data(payload.as_bytes())
+                                    .await
+                                    .map_err(|e| format!("Failed to send sudo password: {}", e))?;
+                            } else {
+                                let _ = channel.close().await;
+                                return Err("SUDO_PASSWORD_REQUIRED: Sudo password required for this host.".to_string());
+                            }
+                        } else {
+                            let _ = channel.close().await;
+                            return Err("SUDO_PASSWORD_INVALID: Incorrect sudo password.".to_string());
+                        }
+                    }
+                }
+                Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
+                    exit_code = Some(exit_status);
+                }
+                Some(russh::ChannelMsg::Eof) | Some(russh::ChannelMsg::Close) | None => {
+                    return Err(format_sudo_failure_detail(&stderr_acc, exit_code));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+
+    match handshake {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let _ = session.disconnect(russh::Disconnect::ByApplication, "", "").await;
+            return Err(e);
+        }
+        Err(_) => {
+            let _ = channel.close().await;
+            let _ = session.disconnect(russh::Disconnect::ByApplication, "", "").await;
+            return Err("Timed out waiting for sudo SFTP elevation on remote host.".to_string());
+        }
+    }
+
+    let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|e| format!("Failed to initialize Sudo SFTP session: {}", e))?;
     sftp.set_timeout(60);
     Ok((sftp, session))
 }
@@ -218,7 +372,56 @@ impl SftpManager {
         }
     }
 
-    pub async fn connect(&self, sftp_session_id: String, host: HostConfig) -> Result<String, String> {
+    pub async fn connect(
+        &self,
+        sftp_session_id: String,
+        host: HostConfig,
+        use_sudo: bool,
+        sudo_password: Option<String>,
+    ) -> Result<String, String> {
+        let effective_sudo_pw = sudo_password
+            .filter(|s| !s.is_empty())
+            .or_else(|| host.password.clone().filter(|s| !s.is_empty()));
+
+        if use_sudo {
+            let (sftp, session_handle) =
+                establish_sftp_russh_sudo(&host, effective_sudo_pw.as_deref()).await?;
+            let initial_dir = match sftp.canonicalize(".").await {
+                Ok(p) => {
+                    let clean = p.replace('\\', "/");
+                    if clean.is_empty() { "/".to_string() } else { clean }
+                }
+                Err(_) => "/".to_string(),
+            };
+
+            let old_session = {
+                let mut lock = self.sessions.lock();
+                lock.insert(
+                    sftp_session_id.clone(),
+                    ActiveSftpSession {
+                        backend: ActiveSftpBackend::Russh {
+                            sftp: Arc::new(sftp),
+                            session: Arc::new(session_handle),
+                        },
+                        host,
+                        current_dir: initial_dir.clone(),
+                        use_sudo: true,
+                        sudo_password: effective_sudo_pw,
+                    },
+                )
+            };
+
+            if let Some(old) = old_session {
+                disconnect_sftp_backend(old.backend, &format!("{} (replaced)", sftp_session_id)).await;
+            }
+
+            println!(
+                "[RustTerm SFTP] [russh SUDO engine] Connected session {} as root. Initial directory: {}",
+                sftp_session_id, initial_dir
+            );
+            return Ok(initial_dir);
+        }
+
         // Modern async pure-Rust SFTP engine (russh-sftp)
         // Supports Ed25519, OpenSSH private keys, password, RSA, interactive
         match establish_sftp_russh(&host).await {
@@ -234,18 +437,26 @@ impl SftpManager {
                     },
                 };
 
-                let mut lock = self.sessions.lock();
-                lock.insert(
-                    sftp_session_id.clone(),
-                    ActiveSftpSession {
-                        backend: ActiveSftpBackend::Russh {
-                            sftp: Arc::new(sftp),
-                            session: Arc::new(session_handle),
+                let old_session = {
+                    let mut lock = self.sessions.lock();
+                    lock.insert(
+                        sftp_session_id.clone(),
+                        ActiveSftpSession {
+                            backend: ActiveSftpBackend::Russh {
+                                sftp: Arc::new(sftp),
+                                session: Arc::new(session_handle),
+                            },
+                            host,
+                            current_dir: initial_dir.clone(),
+                            use_sudo: false,
+                            sudo_password: None,
                         },
-                        host,
-                        current_dir: initial_dir.clone(),
-                    },
-                );
+                    )
+                };
+
+                if let Some(old) = old_session {
+                    disconnect_sftp_backend(old.backend, &format!("{} (replaced)", sftp_session_id)).await;
+                }
 
                 println!(
                     "[RustTerm SFTP] [russh engine] Connected session {}. Initial directory: {}",
@@ -259,12 +470,20 @@ impl SftpManager {
                     return Err(e);
                 }
                 println!("[RustTerm SFTP] Falling back to ssh2 for host: {}", host.hostname);
-                self.connect_ssh2(sftp_session_id, host)
+                let (initial_dir, old_session) = self.connect_ssh2(sftp_session_id.clone(), host)?;
+                if let Some(old) = old_session {
+                    disconnect_sftp_backend(old.backend, &format!("{} (replaced)", sftp_session_id)).await;
+                }
+                Ok(initial_dir)
             }
         }
     }
 
-    fn connect_ssh2(&self, sftp_session_id: String, host: HostConfig) -> Result<String, String> {
+    fn connect_ssh2(
+        &self,
+        sftp_session_id: String,
+        host: HostConfig,
+    ) -> Result<(String, Option<ActiveSftpSession>), String> {
         let sess = establish_authenticated_session(&host)?;
         sess.set_blocking(true);
 
@@ -278,23 +497,27 @@ impl SftpManager {
             }
         };
 
-        let mut lock = self.sessions.lock();
-        lock.insert(
-            sftp_session_id.clone(),
-            ActiveSftpSession {
-                backend: ActiveSftpBackend::Ssh2 {
-                    sess: Arc::new(Mutex::new(sess)),
+        let old_session = {
+            let mut lock = self.sessions.lock();
+            lock.insert(
+                sftp_session_id.clone(),
+                ActiveSftpSession {
+                    backend: ActiveSftpBackend::Ssh2 {
+                        sess: Arc::new(Mutex::new(sess)),
+                    },
+                    host,
+                    current_dir: initial_dir.clone(),
+                    use_sudo: false,
+                    sudo_password: None,
                 },
-                host,
-                current_dir: initial_dir.clone(),
-            },
-        );
+            )
+        };
 
         println!(
             "[RustTerm SFTP] [ssh2 engine] Connected session {}. Initial directory: {}",
             sftp_session_id, initial_dir
         );
-        Ok(initial_dir)
+        Ok((initial_dir, old_session))
     }
 
     pub async fn disconnect(&self, sftp_session_id: &str) -> Result<(), String> {
@@ -333,18 +556,7 @@ impl SftpManager {
         };
 
         if let Some(session) = session {
-            match session.backend {
-                ActiveSftpBackend::Russh { sftp, session } => {
-                    let _ = sftp.close().await;
-                    let _ = session.disconnect(russh::Disconnect::ByApplication, "", "").await;
-                    println!("[RustTerm SFTP] Disconnected russh session {}", sftp_session_id);
-                }
-                ActiveSftpBackend::Ssh2 { sess } => {
-                    let s = sess.lock();
-                    let _ = s.disconnect(None, "SFTP closed", None);
-                    println!("[RustTerm SFTP] Disconnected ssh2 session {}", sftp_session_id);
-                }
-            }
+            disconnect_sftp_backend(session.backend, sftp_session_id).await;
         }
         Ok(())
     }
@@ -1416,12 +1628,17 @@ impl SftpManager {
             });
         }
 
-        let backend = {
+        let (backend, use_sudo, effective_sudo_pw) = {
             let lock = self.sessions.lock();
             let session = lock
                 .get(sftp_session_id)
                 .ok_or_else(|| "SFTP session not found".to_string())?;
-            session.backend.clone()
+            let pw = session
+                .sudo_password
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| session.host.password.clone().filter(|s| !s.is_empty()));
+            (session.backend.clone(), session.use_sudo, pw)
         };
 
         let cancel_flag = self.reset_cancel_flag(sftp_session_id);
@@ -1457,19 +1674,24 @@ impl SftpManager {
 
             let exclude_flags = build_tar_exclude_args(&excludes, &names);
             let quoted_names: Vec<String> = names.iter().map(|n| posix_shell_quote(n)).collect();
-            let cmd = if exclude_flags.is_empty() {
+            let base_tar_args = if exclude_flags.is_empty() {
                 format!(
-                    "LC_ALL=C tar -cf - -C {} {}",
+                    "-cf - -C {} {}",
                     posix_shell_quote(&parent_dir),
                     quoted_names.join(" ")
                 )
             } else {
                 format!(
-                    "LC_ALL=C tar {} -cf - -C {} {}",
+                    "{} -cf - -C {} {}",
                     exclude_flags.join(" "),
                     posix_shell_quote(&parent_dir),
                     quoted_names.join(" ")
                 )
+            };
+            let cmd = if use_sudo {
+                format!("sudo -S -p '__RUSTTERM_PW__' env LC_ALL=C tar {}", base_tar_args)
+            } else {
+                format!("LC_ALL=C tar {}", base_tar_args)
             };
 
             let stats = match backend {
@@ -1505,6 +1727,10 @@ impl SftpManager {
 
                     let mut stderr_buf = String::new();
                     let mut exit_code: Option<u32> = None;
+                    let mut sudo_acc = String::new();
+                    let mut sudo_cursor = 0usize;
+                    let mut sudo_pw_attempts = 0u8;
+                    let mut sudo_err: Option<String> = None;
 
                     loop {
                         if cancel_flag.load(Ordering::SeqCst) {
@@ -1521,8 +1747,40 @@ impl SftpManager {
                                 }
                             }
                             Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
-                                if stderr_buf.len() < 4096 {
-                                    stderr_buf.push_str(&String::from_utf8_lossy(&data));
+                                let chunk_str = String::from_utf8_lossy(&data);
+                                if use_sudo {
+                                    if sudo_acc.len() < 8192 {
+                                        sudo_acc.push_str(&chunk_str);
+                                    }
+                                    while let Some(rel_idx) = sudo_acc[sudo_cursor..].find("__RUSTTERM_PW__") {
+                                        sudo_cursor += rel_idx + "__RUSTTERM_PW__".len();
+                                        if sudo_pw_attempts == 0 {
+                                            if let Some(ref pw) = effective_sudo_pw {
+                                                sudo_pw_attempts += 1;
+                                                let payload = format!("{}\n", pw);
+                                                if let Err(e) = channel.data(payload.as_bytes()).await {
+                                                    sudo_err = Some(format!("Failed to send sudo password for stream: {}", e));
+                                                    let _ = channel.close().await;
+                                                    break;
+                                                }
+                                            } else {
+                                                sudo_err = Some("SUDO_PASSWORD_REQUIRED: Sudo password required for Fast Stream.".to_string());
+                                                let _ = channel.close().await;
+                                                break;
+                                            }
+                                        } else {
+                                            sudo_err = Some("SUDO_PASSWORD_INVALID: Incorrect sudo password for Fast Stream.".to_string());
+                                            let _ = channel.close().await;
+                                            break;
+                                        }
+                                    }
+                                    if sudo_err.is_some() {
+                                        break;
+                                    }
+                                }
+                                let clean_chunk = chunk_str.replace("__RUSTTERM_PW__", "");
+                                if !clean_chunk.is_empty() && stderr_buf.len() < 4096 {
+                                    stderr_buf.push_str(&clean_chunk);
                                 }
                             }
                             Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
@@ -1538,7 +1796,12 @@ impl SftpManager {
                     drop(tx);
                     let extract_res = extractor_handle
                         .await
-                        .map_err(|e| format!("Extractor thread error: {}", e))??;
+                        .map_err(|e| format!("Extractor thread error: {}", e))?;
+
+                    if let Some(err) = sudo_err {
+                        return Err(err);
+                    }
+                    let extract_res = extract_res?;
 
                     if let Some(code) = exit_code {
                         if code != 0 && extract_res.total_files == 0 && extract_res.skipped_items == 0 {

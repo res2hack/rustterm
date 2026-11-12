@@ -517,7 +517,13 @@
               <div class="sftp-subtitle">Dual-Pane SFTP Explorer — Drag &amp; Drop Files/Folders Between Local &amp; Target or From Windows Explorer</div>
             </div>
           </div>
-          <button class="modal-close" id="btn-close-sftp-modal">&times;</button>
+          <div class="sftp-header-actions" style="display: flex; align-items: center; gap: 12px;">
+            <button type="button" id="sftp-btn-sudo-toggle" class="sftp-sudo-toggle" title="Toggle SFTP Sudo Mode (elevate SFTP to root)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+              <span id="sftp-sudo-toggle-label">Sudo: OFF</span>
+            </button>
+            <button class="modal-close" id="btn-close-sftp-modal">&times;</button>
+          </div>
         </div>
 
         <!-- Active Local-Edited Files Watch Bar -->
@@ -787,6 +793,31 @@
         <div class="modal-footer justify-end" style="gap: 8px;">
           <button type="button" class="btn btn-secondary" id="btn-exclude-cancel">Cancel</button>
           <button type="button" class="btn btn-primary" id="btn-exclude-confirm">Save Exclude Rules</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- MODAL: SFTP SUDO PASSWORD PROMPT -->
+    <div id="modal-sftp-sudo-password" class="modal-overlay hidden" style="z-index: 10600;">
+      <div class="modal-content glass-card modal-sm">
+        <div class="modal-header">
+          <div class="modal-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+            <h3>Sudo Authentication</h3>
+          </div>
+          <button class="modal-close" id="btn-sudo-pw-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p id="sftp-sudo-pw-desc" class="section-desc">Enter sudo password to elevate SFTP session as root.</p>
+          <div id="sftp-sudo-pw-error" class="sftp-sudo-pw-error hidden"></div>
+          <div class="form-group">
+            <label for="sftp-sudo-pw-input">Sudo Password</label>
+            <input type="password" id="sftp-sudo-pw-input" placeholder="Enter sudo password..." autocomplete="off" />
+          </div>
+        </div>
+        <div class="modal-footer justify-end" style="gap: 8px;">
+          <button type="button" class="btn btn-secondary" id="btn-sudo-pw-cancel">Cancel</button>
+          <button type="button" class="btn btn-primary" id="btn-sudo-pw-confirm">Connect as Sudo</button>
         </div>
       </div>
     </div>

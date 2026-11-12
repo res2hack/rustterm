@@ -461,6 +461,10 @@ function setupEventListeners() {
   document.getElementById('sftp-btn-resume-transfer').addEventListener('click', () => {
     resumeFailedSftpTransfer();
   });
+  const sftpSudoToggleBtn = document.getElementById('sftp-btn-sudo-toggle');
+  if (sftpSudoToggleBtn) {
+    sftpSudoToggleBtn.addEventListener('click', () => toggleSftpSudoMode());
+  }
 
   // Command History Sidebar Controls
   const btnToggleHist = document.getElementById('tb-btn-toggle-history');
@@ -2368,6 +2372,9 @@ function handleExecuteImport() {
 // =========================================================
 let currentSftpSessionId = null;
 let currentSftpHost = null;
+let currentSftpUseSudo = false;
+let currentSftpSudoPassword = null;
+let isSftpSwitchingSudo = false;
 let currentSftpPath = '/';
 let currentSftpParentPath = null;
 let remoteEntries = [];
@@ -2440,6 +2447,9 @@ function setSftpTransferAlert(mode, text, revealPath = null, showResume = false)
 async function openSftpModal(host) {
   currentSftpHost = host;
   currentSftpSessionId = `sftp-${host.id}-${Date.now()}`;
+  currentSftpUseSudo = false;
+  currentSftpSudoPassword = null;
+  isSftpSwitchingSudo = false;
   selectedRemotePaths.clear();
   selectedLocalPaths.clear();
   lastRemoteClickedIdx = -1;
@@ -2448,6 +2458,7 @@ async function openSftpModal(host) {
   lastFailedSftpTransfer = null;
   renderSftpWatchesBar();
   updateStreamExcludeBadge();
+  updateSftpSudoUI(false);
 
   const modal = document.getElementById('modal-sftp');
   document.getElementById('sftp-modal-host-label').textContent = `${host.username}@${host.hostname}:${host.port}`;
@@ -2483,9 +2494,11 @@ async function openSftpModal(host) {
   try {
     const initialDir = await invokeTauri('sftp_connect', {
       sftpSessionId: currentSftpSessionId,
-      hostConfig: host
+      hostConfig: host,
+      useSudo: false,
+      sudoPassword: null
     });
-    badge.textContent = 'Connected';
+    updateSftpSudoUI(true);
     currentSftpPath = initialDir || '/';
     await sftpLoadDirectory(currentSftpPath);
   } catch (err) {
@@ -2506,17 +2519,219 @@ async function closeSftpModal() {
   document.getElementById('modal-sftp').classList.add('hidden');
   document.getElementById('modal-sftp-conflict').classList.add('hidden');
   document.getElementById('modal-sftp-stream-exclude').classList.add('hidden');
+  const sudoModal = document.getElementById('modal-sftp-sudo-password');
+  if (sudoModal) sudoModal.classList.add('hidden');
 
   await unregisterSftpEventListeners();
 
   activeSftpWatches = [];
   lastFailedSftpTransfer = null;
+  currentSftpUseSudo = false;
+  currentSftpSudoPassword = null;
+  isSftpSwitchingSudo = false;
   renderSftpWatchesBar();
   updateStreamExcludeBadge();
+  updateSftpSudoUI(false);
 
   if (currentSftpSessionId) {
     invokeTauri('sftp_disconnect', { sftpSessionId: currentSftpSessionId }).catch(() => { });
     currentSftpSessionId = null;
+  }
+}
+
+function updateSftpSudoUI(isConnected = true) {
+  const toggleBtn = document.getElementById('sftp-btn-sudo-toggle');
+  const toggleLabel = document.getElementById('sftp-sudo-toggle-label');
+  if (toggleBtn) {
+    toggleBtn.classList.toggle('active', currentSftpUseSudo);
+    toggleBtn.disabled = isSftpSwitchingSudo;
+  }
+  if (toggleLabel) {
+    toggleLabel.textContent = currentSftpUseSudo ? 'Sudo: ON (root)' : 'Sudo: OFF';
+  }
+
+  if (!isConnected) return;
+  const badge = document.getElementById('sftp-status-badge');
+  if (!badge) return;
+  badge.style.background = '';
+  badge.style.color = '';
+  if (currentSftpUseSudo) {
+    badge.className = 'status-badge-small sudo';
+    badge.textContent = 'Connected (SUDO)';
+  } else {
+    badge.className = 'status-badge-small online';
+    badge.textContent = 'Connected';
+  }
+}
+
+function askSftpSudoPassword(description, errorText = '') {
+  return new Promise((resolve) => {
+    const modal = document.getElementById('modal-sftp-sudo-password');
+    const descEl = document.getElementById('sftp-sudo-pw-desc');
+    const errEl = document.getElementById('sftp-sudo-pw-error');
+    const input = document.getElementById('sftp-sudo-pw-input');
+    const btnClose = document.getElementById('btn-sudo-pw-close');
+    const btnCancel = document.getElementById('btn-sudo-pw-cancel');
+    const btnConfirm = document.getElementById('btn-sudo-pw-confirm');
+
+    if (descEl) descEl.textContent = description;
+    if (errEl) {
+      if (errorText) {
+        errEl.textContent = errorText;
+        errEl.classList.remove('hidden');
+      } else {
+        errEl.textContent = '';
+        errEl.classList.add('hidden');
+      }
+    }
+    input.value = '';
+
+    const cleanup = () => {
+      modal.classList.add('hidden');
+      btnClose.removeEventListener('click', onCancel);
+      btnCancel.removeEventListener('click', onCancel);
+      btnConfirm.removeEventListener('click', onConfirm);
+      input.removeEventListener('keydown', onKeyDown);
+    };
+
+    const finish = (val) => {
+      cleanup();
+      resolve(val);
+    };
+
+    const onCancel = () => finish(null);
+    const onConfirm = () => {
+      const pw = input.value;
+      if (!pw) {
+        if (errEl) {
+          errEl.textContent = 'Please enter a sudo password.';
+          errEl.classList.remove('hidden');
+        }
+        input.focus();
+        return;
+      }
+      finish(pw);
+    };
+    const onKeyDown = (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        onConfirm();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        onCancel();
+      }
+    };
+
+    btnClose.addEventListener('click', onCancel);
+    btnCancel.addEventListener('click', onCancel);
+    btnConfirm.addEventListener('click', onConfirm);
+    input.addEventListener('keydown', onKeyDown);
+
+    modal.classList.remove('hidden');
+    setTimeout(() => input.focus(), 30);
+  });
+}
+
+async function toggleSftpSudoMode() {
+  if (!currentSftpSessionId || !currentSftpHost || isSftpSwitchingSudo) return;
+  if (isSftpTransferring) {
+    showToast('Wait for or cancel the active transfer before switching Sudo mode', 'warning');
+    return;
+  }
+
+  const targetSudo = !currentSftpUseSudo;
+  isSftpSwitchingSudo = true;
+  updateSftpSudoUI(false);
+
+  const badge = document.getElementById('sftp-status-badge');
+  if (badge) {
+    badge.className = 'status-badge-small online';
+    badge.style.background = '';
+    badge.style.color = '';
+    badge.textContent = targetSudo ? 'Elevating (SUDO)...' : 'Reconnecting...';
+  }
+
+  const savedRemoteDir = currentSftpPath || '/';
+
+  try {
+    let pwToUse = targetSudo ? currentSftpSudoPassword : null;
+    let initialDir = null;
+
+    try {
+      initialDir = await invokeTauri('sftp_connect', {
+        sftpSessionId: currentSftpSessionId,
+        hostConfig: currentSftpHost,
+        useSudo: targetSudo,
+        sudoPassword: pwToUse
+      });
+    } catch (err) {
+      const msg = String(err?.message || err || '');
+      if (!targetSudo || (!msg.startsWith('SUDO_PASSWORD_REQUIRED:') && !msg.startsWith('SUDO_PASSWORD_INVALID:'))) {
+        throw err;
+      }
+
+      let inlineErr = msg.startsWith('SUDO_PASSWORD_INVALID:')
+        ? 'Host login password was not accepted for sudo. Enter the sudo password:'
+        : '';
+
+      while (true) {
+        const enteredPw = await askSftpSudoPassword(
+          `Enter sudo password for ${currentSftpHost.username}@${currentSftpHost.hostname}`,
+          inlineErr
+        );
+        if (enteredPw === null) {
+          isSftpSwitchingSudo = false;
+          updateSftpSudoUI(true);
+          showToast('Cancelled switching to Sudo mode', 'info');
+          return;
+        }
+
+        if (badge) badge.textContent = 'Elevating (SUDO)...';
+
+        try {
+          initialDir = await invokeTauri('sftp_connect', {
+            sftpSessionId: currentSftpSessionId,
+            hostConfig: currentSftpHost,
+            useSudo: true,
+            sudoPassword: enteredPw
+          });
+          currentSftpSudoPassword = enteredPw;
+          break;
+        } catch (retryErr) {
+          const retryMsg = String(retryErr?.message || retryErr || '');
+          if (retryMsg.startsWith('SUDO_PASSWORD_INVALID:')) {
+            inlineErr = 'Incorrect sudo password. Please try again.';
+            continue;
+          }
+          throw retryErr;
+        }
+      }
+    }
+
+    currentSftpUseSudo = targetSudo;
+    isSftpSwitchingSudo = false;
+    updateSftpSudoUI(true);
+
+    try {
+      await sftpLoadDirectory(savedRemoteDir || initialDir || '/', true);
+    } catch (_) {
+      await sftpLoadDirectory(initialDir || '/', true);
+    }
+
+    if (targetSudo) {
+      setSftpTransferAlert('done', '🛡 Elevated SFTP session to SUDO (root) — you can now browse, upload & edit protected files');
+      showToast('Connected SFTP as SUDO (root)', 'success');
+    } else {
+      setSftpTransferAlert('done', `✔ Switched SFTP back to normal user (${currentSftpHost.username})`);
+      showToast(`Switched SFTP back to ${currentSftpHost.username}`, 'info');
+    }
+  } catch (err) {
+    isSftpSwitchingSudo = false;
+    updateSftpSudoUI(true);
+    const cleanMsg = String(err?.message || err || '')
+      .replace(/^SUDO_PASSWORD_(REQUIRED|INVALID):\s*/i, '');
+    setSftpTransferAlert('error', `❌ Failed to switch Sudo mode: ${cleanMsg}`);
+    showToast(`Failed to switch Sudo mode: ${cleanMsg}`, 'error');
   }
 }
 
@@ -3168,15 +3383,11 @@ async function transferRemoteToLocal(remoteItems, targetLocalDir = currentLocalP
         setSftpTransferAlert('loading', '↻ SFTP session dropped — reconnecting and resuming...');
         await invokeTauri('sftp_connect', {
           sftpSessionId: currentSftpSessionId,
-          hostConfig: currentSftpHost
+          hostConfig: currentSftpHost,
+          useSudo: currentSftpUseSudo,
+          sudoPassword: currentSftpUseSudo ? currentSftpSudoPassword : null
         });
-        const badge = document.getElementById('sftp-status-badge');
-        if (badge) {
-          badge.className = 'status-badge-small online';
-          badge.style.background = '';
-          badge.style.color = '';
-          badge.textContent = 'Connected';
-        }
+        updateSftpSudoUI(true);
         setSftpTransferAlert('loading', `${actionLabel}${excludeInfo} to ${destDir}...`);
         res = await runDownload();
       } else {
