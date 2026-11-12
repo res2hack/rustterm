@@ -4,7 +4,8 @@ mod sftp;
 use std::sync::Arc;
 use ssh::{HostConfig, SshManager};
 use sftp::{
-    DownloadDirResult, DownloadResult, SftpListResult, SftpManager, UploadResult,
+    BatchTransferResult, ConflictItem, DownloadDirResult, DownloadResult, LocalListResult,
+    LocalQuickPaths, SftpListResult, SftpManager, TransferTargetItem, UploadResult, WatchInfo,
 };
 
 use tauri::{AppHandle, Manager, State};
@@ -188,6 +189,150 @@ async fn sftp_delete_item(
 }
 
 #[tauri::command]
+async fn sftp_delete_items(
+    state: State<'_, AppState>,
+    sftp_session_id: String,
+    items: Vec<TransferTargetItem>,
+) -> Result<u32, String> {
+    state.sftp.delete_items(&sftp_session_id, items).await
+}
+
+#[tauri::command]
+async fn sftp_rename_item(
+    state: State<'_, AppState>,
+    sftp_session_id: String,
+    old_path: String,
+    new_name: String,
+) -> Result<String, String> {
+    state.sftp.rename_item(&sftp_session_id, &old_path, &new_name).await
+}
+
+#[tauri::command]
+async fn sftp_check_conflicts(
+    state: State<'_, AppState>,
+    sftp_session_id: String,
+    local_paths: Vec<String>,
+    remote_dir: String,
+) -> Result<Vec<ConflictItem>, String> {
+    state
+        .sftp
+        .check_remote_conflicts(&sftp_session_id, local_paths, remote_dir)
+        .await
+}
+
+#[tauri::command]
+async fn sftp_upload_paths(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    sftp_session_id: String,
+    local_paths: Vec<String>,
+    remote_dir: String,
+    overwrite: bool,
+) -> Result<BatchTransferResult, String> {
+    state
+        .sftp
+        .upload_paths(&app, &sftp_session_id, local_paths, remote_dir, overwrite)
+        .await
+}
+
+#[tauri::command]
+async fn sftp_download_paths(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    sftp_session_id: String,
+    items: Vec<TransferTargetItem>,
+    local_dir: String,
+    overwrite: bool,
+    excludes: Option<Vec<String>>,
+) -> Result<BatchTransferResult, String> {
+    state
+        .sftp
+        .download_paths(
+            &app,
+            &sftp_session_id,
+            items,
+            local_dir,
+            overwrite,
+            excludes.unwrap_or_default(),
+        )
+        .await
+}
+
+#[tauri::command]
+async fn sftp_stream_download(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    sftp_session_id: String,
+    items: Vec<TransferTargetItem>,
+    local_dir: String,
+    overwrite: bool,
+    excludes: Option<Vec<String>>,
+) -> Result<BatchTransferResult, String> {
+    state
+        .sftp
+        .stream_download(
+            &app,
+            &sftp_session_id,
+            items,
+            local_dir,
+            overwrite,
+            excludes.unwrap_or_default(),
+        )
+        .await
+}
+
+#[tauri::command]
+fn sftp_cancel_transfer(state: State<'_, AppState>, sftp_session_id: String) -> bool {
+    state.sftp.cancel_transfer(&sftp_session_id)
+}
+
+#[tauri::command]
+async fn sftp_upload_bytes(
+    state: State<'_, AppState>,
+    sftp_session_id: String,
+    file_name: String,
+    remote_dir: String,
+    bytes: Vec<u8>,
+) -> Result<UploadResult, String> {
+    state
+        .sftp
+        .upload_bytes(&sftp_session_id, &file_name, &remote_dir, bytes)
+        .await
+}
+
+#[tauri::command]
+async fn sftp_edit_remote_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    sftp_session_id: String,
+    remote_path: String,
+) -> Result<WatchInfo, String> {
+    state
+        .sftp
+        .edit_remote_file(app, sftp_session_id, remote_path)
+        .await
+}
+
+#[tauri::command]
+fn sftp_stop_watch(state: State<'_, AppState>, watch_id: String) -> Result<(), String> {
+    state.sftp.stop_watch(&watch_id)
+}
+
+#[tauri::command]
+fn sftp_reopen_watch(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    watch_id: String,
+) -> Result<(), String> {
+    state.sftp.reopen_watch(&app, &watch_id)
+}
+
+#[tauri::command]
+fn sftp_list_watches(state: State<'_, AppState>, sftp_session_id: String) -> Vec<WatchInfo> {
+    state.sftp.list_watches(&sftp_session_id)
+}
+
+#[tauri::command]
 fn sftp_get_default_transfers_dir(host_label: String) -> Result<String, String> {
     let p = sftp::get_default_local_transfers_dir(&host_label);
     Ok(p.to_string_lossy().to_string())
@@ -196,6 +341,53 @@ fn sftp_get_default_transfers_dir(host_label: String) -> Result<String, String> 
 #[tauri::command]
 fn sftp_open_in_explorer(folder_path: String) -> Result<(), String> {
     sftp::open_path_in_explorer(&folder_path)
+}
+
+#[tauri::command]
+fn local_get_quick_paths(host_label: String) -> LocalQuickPaths {
+    sftp::local_get_quick_paths(&host_label)
+}
+
+#[tauri::command]
+fn local_list_dir(target_path: String) -> Result<LocalListResult, String> {
+    sftp::local_list_dir(&target_path)
+}
+
+#[tauri::command]
+fn local_create_dir(parent_dir: String, dir_name: String) -> Result<(), String> {
+    sftp::local_create_dir(&parent_dir, &dir_name)
+}
+
+#[tauri::command]
+fn local_delete_items(paths: Vec<String>) -> Result<u32, String> {
+    sftp::local_delete_items(paths)
+}
+
+#[tauri::command]
+fn local_rename_item(old_path: String, new_name: String) -> Result<String, String> {
+    sftp::local_rename_item(&old_path, &new_name)
+}
+
+#[tauri::command]
+fn local_check_conflicts(
+    items: Vec<TransferTargetItem>,
+    local_dir: String,
+) -> Result<Vec<ConflictItem>, String> {
+    sftp::local_check_conflicts(items, &local_dir)
+}
+
+#[tauri::command]
+fn local_copy_paths(
+    source_paths: Vec<String>,
+    dest_dir: String,
+    overwrite: bool,
+) -> Result<BatchTransferResult, String> {
+    sftp::local_copy_paths(source_paths, &dest_dir, overwrite)
+}
+
+#[tauri::command]
+fn local_open_file(app: AppHandle, path: String) -> Result<(), String> {
+    sftp::open_with_default_editor(&app, std::path::Path::new(&path))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -234,8 +426,28 @@ pub fn run() {
             sftp_upload_file,
             sftp_create_dir,
             sftp_delete_item,
+            sftp_delete_items,
+            sftp_rename_item,
+            sftp_check_conflicts,
+            sftp_upload_paths,
+            sftp_download_paths,
+            sftp_stream_download,
+            sftp_cancel_transfer,
+            sftp_upload_bytes,
+            sftp_edit_remote_file,
+            sftp_stop_watch,
+            sftp_reopen_watch,
+            sftp_list_watches,
             sftp_get_default_transfers_dir,
-            sftp_open_in_explorer
+            sftp_open_in_explorer,
+            local_get_quick_paths,
+            local_list_dir,
+            local_create_dir,
+            local_delete_items,
+            local_rename_item,
+            local_check_conflicts,
+            local_copy_paths,
+            local_open_file
         ])
         .run(tauri::generate_context!());
 

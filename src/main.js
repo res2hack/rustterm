@@ -8,6 +8,8 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import '@xterm/xterm/css/xterm.css';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { listen } from '@tauri-apps/api/event';
 import { DEFAULT_HOSTS } from './default_hosts.js';
 
 // Check if running inside Tauri
@@ -382,9 +384,11 @@ function setupEventListeners() {
     }
   });
 
-  // SFTP Modal Controls
+  // SFTP Dual-Pane Modal Controls
   document.getElementById('btn-close-sftp-modal').addEventListener('click', closeSftpModal);
   document.getElementById('btn-close-sftp-bottom').addEventListener('click', closeSftpModal);
+
+  // Remote Pane Navigation & Actions
   document.getElementById('sftp-btn-up').addEventListener('click', () => {
     if (currentSftpParentPath) sftpLoadDirectory(currentSftpParentPath);
   });
@@ -402,14 +406,60 @@ function setupEventListeners() {
     }
   });
   document.getElementById('sftp-btn-new-folder').addEventListener('click', sftpCreateFolder);
+  document.getElementById('sftp-btn-stream-excludes').addEventListener('click', () => openStreamExcludeModal(null));
   const uploader = document.getElementById('sftp-file-uploader');
   document.getElementById('sftp-btn-upload').addEventListener('click', () => uploader.click());
   uploader.addEventListener('change', handleSftpUploadSelect);
+  document.getElementById('sftp-remote-select-all').addEventListener('change', (e) => {
+    toggleSelectAllPane('remote', e.target.checked);
+  });
+  document.getElementById('sftp-remote-btn-delete-selected').addEventListener('click', sftpDeleteSelectedRemote);
+
+  // Local Pane Navigation & Actions
+  document.getElementById('sftp-local-btn-up').addEventListener('click', () => {
+    if (currentLocalParentPath) localLoadDirectory(currentLocalParentPath);
+  });
+  document.getElementById('sftp-local-btn-refresh').addEventListener('click', () => {
+    localLoadDirectory(currentLocalPath);
+  });
+  document.getElementById('sftp-local-btn-go').addEventListener('click', () => {
+    const p = document.getElementById('sftp-local-path-input').value.trim();
+    if (p) localLoadDirectory(p);
+  });
+  document.getElementById('sftp-local-path-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const p = e.target.value.trim();
+      if (p) localLoadDirectory(p);
+    }
+  });
+  document.getElementById('sftp-local-quick-select').addEventListener('change', (e) => {
+    if (e.target.value) localLoadDirectory(e.target.value);
+  });
+  document.getElementById('sftp-local-btn-new-folder').addEventListener('click', localCreateFolder);
+  document.getElementById('sftp-local-select-all').addEventListener('change', (e) => {
+    toggleSelectAllPane('local', e.target.checked);
+  });
+  document.getElementById('sftp-local-btn-delete-selected').addEventListener('click', localDeleteSelectedItems);
+
+  // Center Transfer Buttons & Explorer Openers
+  document.getElementById('sftp-btn-transfer-upload').addEventListener('click', handleUploadSelectedClick);
+  document.getElementById('sftp-btn-transfer-download').addEventListener('click', handleDownloadSelectedClick);
   document.getElementById('sftp-btn-open-explorer').addEventListener('click', () => {
-    if (defaultLocalDownloadDir) openExplorerToFolder(defaultLocalDownloadDir);
+    const target = currentLocalPath || defaultLocalDownloadDir;
+    if (target) openExplorerToFolder(target);
   });
   document.getElementById('sftp-btn-reveal-file').addEventListener('click', () => {
     if (lastDownloadedLocalPath) openExplorerToFolder(lastDownloadedLocalPath);
+  });
+  document.getElementById('sftp-btn-cancel-transfer').addEventListener('click', async () => {
+    if (!currentSftpSessionId) return;
+    try {
+      await invokeTauri('sftp_cancel_transfer', { sftpSessionId: currentSftpSessionId });
+      showToast('Cancelling active transfer...', 'warning');
+    } catch (_) {}
+  });
+  document.getElementById('sftp-btn-resume-transfer').addEventListener('click', () => {
+    resumeFailedSftpTransfer();
   });
 
   // Command History Sidebar Controls
@@ -478,9 +528,18 @@ function setupEventListeners() {
     termRO.observe(termContainer);
   }
 
-  // Disable default browser context menu globally, but open SSH terminal context menu when right-clicking on terminal
+  // Disable default browser context menu globally, but open custom context menus in SSH terminal or SFTP panes
   window.addEventListener('contextmenu', (e) => {
     e.preventDefault();
+    const sftpModal = document.getElementById('modal-sftp');
+    if (sftpModal && !sftpModal.classList.contains('hidden')) {
+      const sftpPane = e.target.closest('.sftp-pane');
+      if (sftpPane) {
+        const row = e.target.closest('tr[data-entry-path]');
+        openSftpContextMenu(e, sftpPane.dataset.pane, row ? row.dataset.entryPath : null);
+        return;
+      }
+    }
     const termPane = e.target.closest('.terminal-pane') || e.target.closest('#terminal-container');
     if (termPane && activeSessionId && activeSessionId !== 'home') {
       openTerminalContextMenu(e, activeSessionId);
@@ -491,6 +550,7 @@ function setupEventListeners() {
   window.addEventListener('click', (e) => {
     if (!e.target.closest('#active-action-menu') &&
       !e.target.closest('#active-terminal-context-menu') &&
+      !e.target.closest('#active-sftp-context-menu') &&
       !e.target.closest('.btn-host-actions') &&
       !e.target.closest('.btn-vcard-menu') &&
       !e.target.closest('.btn-open-actions') &&
@@ -1026,6 +1086,10 @@ function closeAllActionMenus() {
   const termMenu = document.getElementById('active-terminal-context-menu');
   if (termMenu) {
     termMenu.remove();
+  }
+  const sftpMenu = document.getElementById('active-sftp-context-menu');
+  if (sftpMenu) {
+    sftpMenu.remove();
   }
 }
 
@@ -2300,38 +2364,122 @@ function handleExecuteImport() {
 }
 
 // =========================================================
-// SFTP File & Folder Manager Controller
+// Dual-Pane SFTP File & Folder Manager Controller
 // =========================================================
 let currentSftpSessionId = null;
 let currentSftpHost = null;
 let currentSftpPath = '/';
 let currentSftpParentPath = null;
+let remoteEntries = [];
+let selectedRemotePaths = new Set();
+let lastRemoteClickedIdx = -1;
+
+let currentLocalPath = '';
+let currentLocalParentPath = null;
+let localQuickPaths = null;
+let localEntries = [];
+let selectedLocalPaths = new Set();
+let lastLocalClickedIdx = -1;
+
 let defaultLocalDownloadDir = '';
 let lastDownloadedLocalPath = '';
+let activeSftpWatches = [];
+let isSftpTransferring = false;
+let lastFailedSftpTransfer = null;
+
+let sftpUnlistenDragDrop = null;
+let sftpUnlistenProgress = null;
+let sftpUnlistenAutoUpload = null;
+let sftpDragState = null;
+
+function getEntryIcon(name, isDir) {
+  if (isDir) return '📁';
+  const lower = (name || '').toLowerCase();
+  if (/\.(zip|tar|gz|tgz|rar|7z|bz2|xz)$/.test(lower)) return '📦';
+  if (/\.(js|ts|jsx|tsx|rs|py|go|java|c|cpp|h|json|yaml|yml|toml|xml|html|css|sh|bash|conf|ini|env|md|sql|php|rb|txt|log)$/.test(lower)) return '📝';
+  if (/\.(png|jpg|jpeg|gif|svg|webp|ico|bmp)$/.test(lower)) return '🖼️';
+  return '📄';
+}
+
+function setSftpTransferAlert(mode, text, revealPath = null, showResume = false) {
+  const alertEl = document.getElementById('sftp-transfer-alert');
+  const alertText = document.getElementById('sftp-transfer-text');
+  const spinner = document.getElementById('sftp-transfer-spinner');
+  const revealBtn = document.getElementById('sftp-btn-reveal-file');
+  const cancelBtn = document.getElementById('sftp-btn-cancel-transfer');
+  const resumeBtn = document.getElementById('sftp-btn-resume-transfer');
+
+  alertEl.classList.remove('hidden');
+  alertEl.classList.toggle('alert-error', mode === 'error');
+  alertText.textContent = text;
+
+  if (mode === 'loading') {
+    spinner.classList.remove('hidden');
+    revealBtn.classList.add('hidden');
+    if (cancelBtn) cancelBtn.classList.remove('hidden');
+    if (resumeBtn) resumeBtn.classList.add('hidden');
+  } else {
+    spinner.classList.add('hidden');
+    if (cancelBtn) cancelBtn.classList.add('hidden');
+    if (resumeBtn) {
+      if (showResume && lastFailedSftpTransfer) {
+        resumeBtn.classList.remove('hidden');
+      } else {
+        resumeBtn.classList.add('hidden');
+      }
+    }
+    if (revealPath) {
+      lastDownloadedLocalPath = revealPath;
+      revealBtn.classList.remove('hidden');
+    } else {
+      revealBtn.classList.add('hidden');
+    }
+  }
+}
 
 async function openSftpModal(host) {
   currentSftpHost = host;
   currentSftpSessionId = `sftp-${host.id}-${Date.now()}`;
+  selectedRemotePaths.clear();
+  selectedLocalPaths.clear();
+  lastRemoteClickedIdx = -1;
+  lastLocalClickedIdx = -1;
+  activeSftpWatches = [];
+  lastFailedSftpTransfer = null;
+  renderSftpWatchesBar();
+  updateStreamExcludeBadge();
 
   const modal = document.getElementById('modal-sftp');
   document.getElementById('sftp-modal-host-label').textContent = `${host.username}@${host.hostname}:${host.port}`;
   const badge = document.getElementById('sftp-status-badge');
   badge.className = 'status-badge-small online';
+  badge.style.background = '';
+  badge.style.color = '';
   badge.textContent = 'Connecting...';
-  document.getElementById('sftp-transfer-alert').classList.add('hidden');
+  const alertEl = document.getElementById('sftp-transfer-alert');
+  alertEl.classList.add('hidden');
+  alertEl.classList.remove('alert-error');
   document.getElementById('sftp-btn-reveal-file').classList.add('hidden');
-
-  // Load default transfers directory
-  try {
-    defaultLocalDownloadDir = await invokeTauri('sftp_get_default_transfers_dir', { hostLabel: host.label || host.hostname });
-    document.getElementById('sftp-local-dest-display').textContent = defaultLocalDownloadDir;
-  } catch (e) {
-    console.warn('Could not get default transfer dir:', e);
-  }
+  const resumeBtn = document.getElementById('sftp-btn-resume-transfer');
+  if (resumeBtn) resumeBtn.classList.add('hidden');
 
   modal.classList.remove('hidden');
 
-  // Connect SFTP
+  // Register Tauri Drag-and-Drop and Transfer/Watch Event Listeners
+  await registerSftpEventListeners();
+
+  // Initialize Local Computer Pane (Left Pane)
+  try {
+    localQuickPaths = await invokeTauri('local_get_quick_paths', { hostLabel: host.label || host.hostname });
+    defaultLocalDownloadDir = localQuickPaths.transfers || '';
+    populateLocalQuickSelect(localQuickPaths);
+    const startLocalDir = currentLocalPath || localQuickPaths.transfers || localQuickPaths.downloads || localQuickPaths.home;
+    await localLoadDirectory(startLocalDir);
+  } catch (e) {
+    console.warn('Could not initialize local pane:', e);
+  }
+
+  // Connect Target Server SFTP (Right Pane)
   try {
     const initialDir = await invokeTauri('sftp_connect', {
       sftpSessionId: currentSftpSessionId,
@@ -2346,25 +2494,234 @@ async function openSftpModal(host) {
     badge.style.color = '#f87171';
     badge.textContent = 'Failed';
     const tbody = document.getElementById('sftp-file-tbody');
-    tbody.innerHTML = `<tr><td colspan="4" style="text-align: center; padding: 24px; color: #f87171;">Connection failed: ${escapeHtml(err.message || err)}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; padding: 24px; color: #f87171;">Connection failed: ${escapeHtml(err.message || err)}</td></tr>`;
     showToast(`SFTP Connection error: ${err.message || err}`, 'error');
   }
 }
 
 async function closeSftpModal() {
+  closeAllActionMenus();
+  clearSftpDropHighlights();
+  cleanupSftpDragGhost();
   document.getElementById('modal-sftp').classList.add('hidden');
+  document.getElementById('modal-sftp-conflict').classList.add('hidden');
+  document.getElementById('modal-sftp-stream-exclude').classList.add('hidden');
+
+  await unregisterSftpEventListeners();
+
+  activeSftpWatches = [];
+  lastFailedSftpTransfer = null;
+  renderSftpWatchesBar();
+  updateStreamExcludeBadge();
+
   if (currentSftpSessionId) {
     invokeTauri('sftp_disconnect', { sftpSessionId: currentSftpSessionId }).catch(() => { });
     currentSftpSessionId = null;
   }
 }
 
-async function sftpLoadDirectory(targetPath = null) {
+async function registerSftpEventListeners() {
+  await unregisterSftpEventListeners();
+  if (!isTauri) return;
+
+  try {
+    sftpUnlistenDragDrop = await getCurrentWebview().onDragDropEvent((event) => {
+      handleOsDragDropEvent(event.payload);
+    });
+  } catch (e) {
+    console.warn('Could not attach OS drag-drop listener:', e);
+  }
+
+  try {
+    sftpUnlistenProgress = await listen('sftp-transfer-progress', (event) => {
+      const p = event.payload;
+      if (!p || p.sftp_session_id !== currentSftpSessionId) return;
+      const verb = p.direction === 'upload'
+        ? 'Uploading'
+        : p.direction === 'stream'
+          ? '⚡ Fast Streaming'
+          : 'Downloading';
+      const speedText = p.speed_bps > 0 ? ` @ ${formatFileSize(p.speed_bps)}/s` : '';
+      setSftpTransferAlert('loading', `${verb} (${p.total_files} files • ${formatFileSize(p.total_bytes)}${speedText}): ${p.current_item}`);
+    });
+  } catch (e) {
+    console.warn('Could not attach transfer progress listener:', e);
+  }
+
+  try {
+    sftpUnlistenAutoUpload = await listen('sftp-auto-upload', async (event) => {
+      const ev = event.payload;
+      if (!ev || ev.sftp_session_id !== currentSftpSessionId) return;
+
+      if (ev.status === 'success') {
+        const w = activeSftpWatches.find(item => item.watch_id === ev.watch_id);
+        if (w) {
+          w.upload_count = ev.upload_count;
+          w.last_upload_at = Math.floor(Date.now() / 1000);
+        } else {
+          await refreshSftpWatches();
+        }
+        renderSftpWatchesBar();
+        setSftpTransferAlert('done', `✔ Auto-uploaded '${ev.file_name}' (${formatFileSize(ev.bytes_transferred)}) to ${ev.remote_path}`);
+        showToast(`Auto-uploaded '${ev.file_name}' (${formatFileSize(ev.bytes_transferred)})`, 'success');
+        await sftpLoadDirectory(currentSftpPath, true);
+      } else {
+        showToast(`Auto-upload failed for '${ev.file_name}': ${ev.error || 'Unknown error'}`, 'error');
+      }
+    });
+  } catch (e) {
+    console.warn('Could not attach auto-upload listener:', e);
+  }
+}
+
+async function unregisterSftpEventListeners() {
+  if (typeof sftpUnlistenDragDrop === 'function') {
+    try { sftpUnlistenDragDrop(); } catch (_) {}
+    sftpUnlistenDragDrop = null;
+  }
+  if (typeof sftpUnlistenProgress === 'function') {
+    try { sftpUnlistenProgress(); } catch (_) {}
+    sftpUnlistenProgress = null;
+  }
+  if (typeof sftpUnlistenAutoUpload === 'function') {
+    try { sftpUnlistenAutoUpload(); } catch (_) {}
+    sftpUnlistenAutoUpload = null;
+  }
+}
+
+function populateLocalQuickSelect(qp) {
+  const select = document.getElementById('sftp-local-quick-select');
+  if (!select || !qp) return;
+  select.innerHTML = '';
+
+  const opts = [
+    { label: '📥 Transfers Folder', path: qp.transfers },
+    { label: '⬇️ Downloads', path: qp.downloads },
+    { label: '🖥️ Desktop', path: qp.desktop },
+    { label: '📄 Documents', path: qp.documents },
+    { label: '🏠 Home', path: qp.home },
+  ];
+  (qp.drives || []).forEach(drv => {
+    opts.push({ label: `💾 Drive (${drv})`, path: drv });
+  });
+
+  opts.forEach(o => {
+    if (!o.path) return;
+    const opt = document.createElement('option');
+    opt.value = o.path;
+    opt.textContent = o.label;
+    select.appendChild(opt);
+  });
+}
+
+function syncLocalQuickSelectValue(path) {
+  const select = document.getElementById('sftp-local-quick-select');
+  if (!select) return;
+  const match = Array.from(select.options).find(opt => opt.value.toLowerCase() === (path || '').toLowerCase());
+  if (match) {
+    select.value = match.value;
+  }
+}
+
+// =========================================================
+// Local Pane Operations (Left Pane)
+// =========================================================
+async function localLoadDirectory(targetPath, preserveSelection = false) {
+  const tbody = document.getElementById('sftp-local-tbody');
+  const emptyHint = document.getElementById('sftp-local-empty-hint');
+  emptyHint.classList.add('hidden');
+  if (!preserveSelection) {
+    selectedLocalPaths.clear();
+    lastLocalClickedIdx = -1;
+    tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; padding: 24px; color: var(--text-dim);"><div class="transfer-spinner" style="margin: 0 auto 8px auto;"></div>Loading local files...</td></tr>`;
+  }
+
+  try {
+    const res = await invokeTauri('local_list_dir', { targetPath: targetPath || currentLocalPath });
+    currentLocalPath = res.current_path;
+    currentLocalParentPath = res.parent_path;
+    localEntries = res.entries || [];
+    document.getElementById('sftp-local-path-input').value = currentLocalPath;
+    syncLocalQuickSelectValue(currentLocalPath);
+    renderPaneEntries('local', localEntries);
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; padding: 24px; color: #f87171;">Failed to read local directory: ${escapeHtml(err.message || err)}</td></tr>`;
+    showToast(`Local directory error: ${err.message || err}`, 'error');
+  }
+}
+
+async function localCreateFolder() {
+  if (!currentLocalPath) return;
+  const folderName = prompt('Enter name for new local folder:');
+  if (!folderName || !folderName.trim()) return;
+
+  try {
+    await invokeTauri('local_create_dir', {
+      parentDir: currentLocalPath,
+      dirName: folderName.trim()
+    });
+    showToast(`Created local folder '${folderName.trim()}'`, 'success');
+    await localLoadDirectory(currentLocalPath);
+  } catch (err) {
+    showToast(`Failed to create local folder: ${err.message || err}`, 'error');
+  }
+}
+
+async function localDeleteItems(paths, displayLabel) {
+  if (!paths || paths.length === 0) return;
+  const msg = paths.length === 1
+    ? `Are you sure you want to delete local '${displayLabel}'?`
+    : `Are you sure you want to delete ${paths.length} selected local items (folders will be deleted with contents)?`;
+  if (!confirm(msg)) return;
+
+  try {
+    const count = await invokeTauri('local_delete_items', { paths });
+    showToast(`Deleted ${count} local item(s)`, 'info');
+    await localLoadDirectory(currentLocalPath);
+  } catch (err) {
+    showToast(`Local delete failed: ${err.message || err}`, 'error');
+  }
+}
+
+async function localDeleteSelectedItems() {
+  const paths = Array.from(selectedLocalPaths);
+  await localDeleteItems(paths, `${paths.length} items`);
+}
+
+async function localRenameEntry(entry) {
+  const newName = prompt(`Rename '${entry.name}' to:`, entry.name);
+  if (!newName || !newName.trim() || newName.trim() === entry.name) return;
+  try {
+    await invokeTauri('local_rename_item', { oldPath: entry.path, newName: newName.trim() });
+    showToast(`Renamed to '${newName.trim()}'`, 'success');
+    await localLoadDirectory(currentLocalPath);
+  } catch (err) {
+    showToast(`Rename failed: ${err.message || err}`, 'error');
+  }
+}
+
+async function localOpenFile(entry) {
+  if (!entry || entry.is_dir) return;
+  try {
+    await invokeTauri('local_open_file', { path: entry.path });
+  } catch (err) {
+    showToast(`Could not open '${entry.name}': ${err.message || err}`, 'error');
+  }
+}
+
+// =========================================================
+// Remote Pane Operations (Right Pane)
+// =========================================================
+async function sftpLoadDirectory(targetPath = null, preserveSelection = false) {
   if (!currentSftpSessionId) return;
   const tbody = document.getElementById('sftp-file-tbody');
   const emptyHint = document.getElementById('sftp-empty-hint');
   emptyHint.classList.add('hidden');
-  tbody.innerHTML = `<tr><td colspan="4" style="text-align: center; padding: 24px; color: var(--text-dim);"><div class="transfer-spinner" style="margin: 0 auto 8px auto;"></div>Loading remote files...</td></tr>`;
+  if (!preserveSelection) {
+    selectedRemotePaths.clear();
+    lastRemoteClickedIdx = -1;
+    tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; padding: 24px; color: var(--text-dim);"><div class="transfer-spinner" style="margin: 0 auto 8px auto;"></div>Loading remote files...</td></tr>`;
+  }
 
   try {
     const res = await invokeTauri('sftp_list_dir', {
@@ -2374,24 +2731,30 @@ async function sftpLoadDirectory(targetPath = null) {
 
     currentSftpPath = res.current_path;
     currentSftpParentPath = res.parent_path;
+    remoteEntries = res.entries || [];
     document.getElementById('sftp-path-input').value = currentSftpPath;
 
-    renderSftpEntries(res.entries);
+    renderPaneEntries('remote', remoteEntries);
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="4" style="text-align: center; padding: 24px; color: #f87171;">Failed to read directory: ${escapeHtml(err.message || err)}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; padding: 24px; color: #f87171;">Failed to read directory: ${escapeHtml(err.message || err)}</td></tr>`;
     showToast(`SFTP listing failed: ${err.message || err}`, 'error');
   }
 }
 
-function renderSftpEntries(entries) {
-  const tbody = document.getElementById('sftp-file-tbody');
-  const emptyHint = document.getElementById('sftp-empty-hint');
-  const statsEl = document.getElementById('sftp-stats-text');
+// Unified Renderer for Both Panes (Local & Remote)
+function renderPaneEntries(pane, entries) {
+  const isLocal = pane === 'local';
+  const tbody = document.getElementById(isLocal ? 'sftp-local-tbody' : 'sftp-file-tbody');
+  const emptyHint = document.getElementById(isLocal ? 'sftp-local-empty-hint' : 'sftp-empty-hint');
+  const statsEl = document.getElementById(isLocal ? 'sftp-local-stats' : 'sftp-stats-text');
+  const selectedSet = isLocal ? selectedLocalPaths : selectedRemotePaths;
+
   tbody.innerHTML = '';
 
   if (!entries || entries.length === 0) {
     emptyHint.classList.remove('hidden');
     statsEl.textContent = '0 items';
+    updatePaneSelectionUI(pane);
     return;
   }
 
@@ -2400,79 +2763,138 @@ function renderSftpEntries(entries) {
   const fileCount = entries.filter(e => !e.is_dir).length;
   statsEl.textContent = `${entries.length} items (${dirCount} folders, ${fileCount} files)`;
 
-  entries.forEach(entry => {
+  entries.forEach((entry, idx) => {
     const tr = document.createElement('tr');
-    tr.className = entry.is_dir ? 'clickable' : '';
-
-    let icon = '📄';
-    if (entry.is_dir) {
-      icon = '📁';
-    } else if (entry.name.endsWith('.zip') || entry.name.endsWith('.tar') || entry.name.endsWith('.gz')) {
-      icon = '📦';
-    } else if (entry.name.endsWith('.js') || entry.name.endsWith('.rs') || entry.name.endsWith('.py') || entry.name.endsWith('.json') || entry.name.endsWith('.sh')) {
-      icon = '📝';
-    } else if (entry.name.endsWith('.png') || entry.name.endsWith('.jpg') || entry.name.endsWith('.svg')) {
-      icon = '🖼️';
+    tr.dataset.pane = pane;
+    tr.dataset.entryPath = entry.path;
+    tr.dataset.entryName = entry.name;
+    tr.dataset.isDir = entry.is_dir ? 'true' : 'false';
+    if (selectedSet.has(entry.path)) {
+      tr.classList.add('sftp-row-selected');
     }
 
+    const icon = getEntryIcon(entry.name, entry.is_dir);
     const sizeFormatted = entry.is_dir ? '—' : formatFileSize(entry.size);
     const dateFormatted = entry.modified ? formatDate(entry.modified) : '—';
+    const isChecked = selectedSet.has(entry.path) ? 'checked' : '';
+
+    let actionsHtml = '';
+    if (isLocal) {
+      actionsHtml = `
+        <button class="btn-table-action download-btn btn-row-upload" title="Upload to Target Server">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+          <span>Upload</span>
+        </button>
+        ${!entry.is_dir ? `<button class="btn-table-action edit-btn btn-row-local-open" title="Open with default local app"><span>Open</span></button>` : ''}
+        <button class="btn-table-action delete-btn btn-row-delete" title="Delete local item">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+        </button>
+      `;
+    } else {
+      actionsHtml = `
+        ${entry.is_dir
+          ? `<button class="btn-table-action stream-btn btn-row-stream" title="Fast Stream Download via SSH tar pipe (0 bytes server disk, best for large/image folders)">
+              <span>⚡ Stream</span>
+             </button>`
+          : `<button class="btn-table-action edit-btn btn-row-remote-edit" title="Download to temp, open in local editor & auto-upload on save">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>
+              <span>Edit</span>
+             </button>`}
+        <button class="btn-table-action download-btn btn-row-download" title="${entry.is_dir ? 'Parallel SFTP Download (supports Smart Resume)' : 'Download to current Local folder'}">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+        </button>
+        <button class="btn-table-action delete-btn btn-row-delete" title="Delete from server">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+        </button>
+      `;
+    }
 
     tr.innerHTML = `
-      <td>
-        <div class="file-name-cell">
+      <td class="col-check"><input type="checkbox" class="sftp-row-check" ${isChecked} /></td>
+      <td class="col-name">
+        <div class="file-name-cell ${entry.is_dir ? 'is-dir-link' : ''}">
           <span class="file-icon">${icon}</span>
-          <span class="file-name-text">${escapeHtml(entry.name)}</span>
+          <span class="file-name-text" title="${escapeHtml(entry.name)}">${escapeHtml(entry.name)}</span>
         </div>
       </td>
       <td class="col-size">${sizeFormatted}</td>
       <td class="col-modified">${dateFormatted}</td>
       <td class="col-actions">
-        <div class="sftp-row-actions">
-          ${entry.is_dir
-        ? `<button class="btn-table-action download-btn btn-dl-dir" title="Download entire folder and contents from server">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-                <span>Download Folder</span>
-               </button>`
-        : `<button class="btn-table-action download-btn btn-dl-file" title="Download file from server">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-                <span>Download File</span>
-               </button>`
-      }
-          <button class="btn-table-action delete-btn btn-del-item" title="Delete from server">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
-          </button>
-        </div>
+        <div class="sftp-row-actions">${actionsHtml}</div>
       </td>
     `;
 
-    // Folder navigation on row click (if not clicking action button)
-    if (entry.is_dir) {
-      tr.addEventListener('click', (e) => {
-        if (e.target.closest('.btn-table-action')) return;
-        sftpLoadDirectory(entry.path);
-      });
+    // Checkbox multi-select
+    const chk = tr.querySelector('.sftp-row-check');
+    chk.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleRowSelection(pane, entry.path, idx, chk.checked, e.shiftKey);
+    });
 
-      const dlDirBtn = tr.querySelector('.btn-dl-dir');
-      if (dlDirBtn) {
-        dlDirBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          sftpDownloadFolder(entry.path, entry.name);
-        });
-      }
-    } else {
-      const dlFileBtn = tr.querySelector('.btn-dl-file');
-      if (dlFileBtn) {
-        dlFileBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          sftpDownloadFile(entry.path, entry.name);
-        });
-      }
+    // Clicking folder name enters folder directly
+    if (entry.is_dir) {
+      const nameWrap = tr.querySelector('.file-name-cell');
+      nameWrap.addEventListener('click', (e) => {
+        if (e.ctrlKey || e.metaKey || e.shiftKey) return;
+        e.stopPropagation();
+        if (isLocal) localLoadDirectory(entry.path);
+        else sftpLoadDirectory(entry.path);
+      });
     }
 
-    const delBtn = tr.querySelector('.btn-del-item');
-    if (delBtn) {
-      delBtn.addEventListener('click', (e) => {
+    // Row click for selection (with Ctrl/Shift multi-select)
+    tr.addEventListener('click', (e) => {
+      if (e.target.closest('.btn-table-action') || e.target.closest('.sftp-row-check')) return;
+      handleRowClickSelection(pane, entry.path, idx, e);
+    });
+
+    // Double-click: open folder or view/edit file
+    tr.addEventListener('dblclick', (e) => {
+      if (e.target.closest('.btn-table-action') || e.target.closest('.sftp-row-check')) return;
+      if (entry.is_dir) {
+        if (isLocal) localLoadDirectory(entry.path);
+        else sftpLoadDirectory(entry.path);
+      } else {
+        if (isLocal) localOpenFile(entry);
+        else sftpEditRemoteFile(entry);
+      }
+    });
+
+    // Pointer Drag & Drop initiation (Local <-> Target)
+    tr.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      if (e.target.closest('.btn-table-action') || e.target.closest('.sftp-row-check')) return;
+      startSftpPointerDrag(e, pane, entry);
+    });
+
+    // Row Action Buttons
+    if (isLocal) {
+      tr.querySelector('.btn-row-upload')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        transferLocalToRemote([entry.path], currentSftpPath);
+      });
+      tr.querySelector('.btn-row-local-open')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        localOpenFile(entry);
+      });
+      tr.querySelector('.btn-row-delete')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        localDeleteItems([entry.path], entry.name);
+      });
+    } else {
+      tr.querySelector('.btn-row-stream')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        sftpStreamDownload([{ path: entry.path, name: entry.name, is_dir: entry.is_dir, size: entry.size || 0 }], currentLocalPath);
+      });
+      tr.querySelector('.btn-row-remote-edit')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        sftpEditRemoteFile(entry);
+      });
+      tr.querySelector('.btn-row-download')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        transferRemoteToLocal([{ path: entry.path, name: entry.name, is_dir: entry.is_dir, size: entry.size || 0 }], currentLocalPath);
+      });
+      tr.querySelector('.btn-row-delete')?.addEventListener('click', (e) => {
         e.stopPropagation();
         sftpDeleteItem(entry.path, entry.is_dir, entry.name);
       });
@@ -2480,101 +2902,930 @@ function renderSftpEntries(entries) {
 
     tbody.appendChild(tr);
   });
+
+  updatePaneSelectionUI(pane);
 }
 
-async function sftpDownloadFile(remotePath, fileName) {
-  if (!currentSftpSessionId) return;
-  const alertEl = document.getElementById('sftp-transfer-alert');
-  const alertText = document.getElementById('sftp-transfer-text');
-  const spinner = document.getElementById('sftp-transfer-spinner');
-  const revealBtn = document.getElementById('sftp-btn-reveal-file');
+function toggleRowSelection(pane, path, idx, isSelected, isShift) {
+  const isLocal = pane === 'local';
+  const entries = isLocal ? localEntries : remoteEntries;
+  const set = isLocal ? selectedLocalPaths : selectedRemotePaths;
+  const lastIdx = isLocal ? lastLocalClickedIdx : lastRemoteClickedIdx;
 
-  alertEl.classList.remove('hidden');
-  spinner.classList.remove('hidden');
-  revealBtn.classList.add('hidden');
-  alertText.textContent = `Downloading '${fileName}' from server...`;
+  if (isShift && lastIdx >= 0 && lastIdx < entries.length) {
+    const start = Math.min(lastIdx, idx);
+    const end = Math.max(lastIdx, idx);
+    for (let i = start; i <= end; i++) {
+      if (isSelected) set.add(entries[i].path);
+      else set.delete(entries[i].path);
+    }
+  } else {
+    if (isSelected) set.add(path);
+    else set.delete(path);
+  }
 
-  try {
-    const res = await invokeTauri('sftp_download_file', {
-      sftpSessionId: currentSftpSessionId,
-      remotePath: remotePath,
-      localPath: null
-    });
+  if (isLocal) lastLocalClickedIdx = idx;
+  else lastRemoteClickedIdx = idx;
 
-    lastDownloadedLocalPath = res.local_path;
-    spinner.classList.add('hidden');
-    alertText.textContent = `✔ Downloaded '${fileName}' (${formatFileSize(res.bytes_transferred)}) to ${res.local_path}`;
-    revealBtn.classList.remove('hidden');
-    showToast(`Downloaded '${fileName}'`, 'success');
-  } catch (err) {
-    spinner.classList.add('hidden');
-    alertText.textContent = `❌ Download failed: ${err.message || err}`;
-    showToast(`Download failed: ${err.message || err}`, 'error');
+  updatePaneSelectionUI(pane);
+}
+
+function handleRowClickSelection(pane, path, idx, e) {
+  const isLocal = pane === 'local';
+  const entries = isLocal ? localEntries : remoteEntries;
+  const set = isLocal ? selectedLocalPaths : selectedRemotePaths;
+  const lastIdx = isLocal ? lastLocalClickedIdx : lastRemoteClickedIdx;
+
+  if (e.shiftKey && lastIdx >= 0 && lastIdx < entries.length) {
+    if (!e.ctrlKey && !e.metaKey) set.clear();
+    const start = Math.min(lastIdx, idx);
+    const end = Math.max(lastIdx, idx);
+    for (let i = start; i <= end; i++) {
+      set.add(entries[i].path);
+    }
+  } else if (e.ctrlKey || e.metaKey) {
+    if (set.has(path)) set.delete(path);
+    else set.add(path);
+    if (isLocal) lastLocalClickedIdx = idx;
+    else lastRemoteClickedIdx = idx;
+  } else {
+    set.clear();
+    set.add(path);
+    if (isLocal) lastLocalClickedIdx = idx;
+    else lastRemoteClickedIdx = idx;
+  }
+
+  updatePaneSelectionUI(pane);
+}
+
+function toggleSelectAllPane(pane, checked) {
+  const isLocal = pane === 'local';
+  const entries = isLocal ? localEntries : remoteEntries;
+  const set = isLocal ? selectedLocalPaths : selectedRemotePaths;
+  set.clear();
+  if (checked) {
+    entries.forEach(e => set.add(e.path));
+  }
+  updatePaneSelectionUI(pane);
+}
+
+function updatePaneSelectionUI(pane) {
+  const isLocal = pane === 'local';
+  const entries = isLocal ? localEntries : remoteEntries;
+  const set = isLocal ? selectedLocalPaths : selectedRemotePaths;
+  const tbody = document.getElementById(isLocal ? 'sftp-local-tbody' : 'sftp-file-tbody');
+  const selectAllChk = document.getElementById(isLocal ? 'sftp-local-select-all' : 'sftp-remote-select-all');
+  const selectedStats = document.getElementById(isLocal ? 'sftp-local-selected-stats' : 'sftp-remote-selected-stats');
+  const delBtn = document.getElementById(isLocal ? 'sftp-local-btn-delete-selected' : 'sftp-remote-btn-delete-selected');
+  const delCount = document.getElementById(isLocal ? 'sftp-local-del-count' : 'sftp-remote-del-count');
+  const centerBtn = document.getElementById(isLocal ? 'sftp-btn-transfer-upload' : 'sftp-btn-transfer-download');
+
+  tbody.querySelectorAll('tr[data-entry-path]').forEach(tr => {
+    const p = tr.dataset.entryPath;
+    const isSel = set.has(p);
+    tr.classList.toggle('sftp-row-selected', isSel);
+    const chk = tr.querySelector('.sftp-row-check');
+    if (chk) chk.checked = isSel;
+  });
+
+  if (selectAllChk) {
+    selectAllChk.checked = entries.length > 0 && set.size === entries.length;
+    selectAllChk.indeterminate = set.size > 0 && set.size < entries.length;
+  }
+
+  if (selectedStats) {
+    selectedStats.textContent = set.size > 0 ? `${set.size} selected` : '';
+  }
+
+  if (delBtn && delCount) {
+    delBtn.classList.toggle('hidden', set.size === 0);
+    delCount.textContent = String(set.size);
+  }
+
+  if (centerBtn) {
+    centerBtn.disabled = set.size === 0;
   }
 }
 
-async function sftpDownloadFolder(remoteDir, folderName) {
-  if (!currentSftpSessionId) return;
-  const alertEl = document.getElementById('sftp-transfer-alert');
-  const alertText = document.getElementById('sftp-transfer-text');
-  const spinner = document.getElementById('sftp-transfer-spinner');
-  const revealBtn = document.getElementById('sftp-btn-reveal-file');
+// =========================================================
+// Overwrite Confirmation Modal
+// =========================================================
+function askOverwriteConfirmation(conflicts, directionLabel) {
+  return new Promise((resolve) => {
+    const modal = document.getElementById('modal-sftp-conflict');
+    const summaryEl = document.getElementById('sftp-conflict-summary');
+    const listEl = document.getElementById('sftp-conflict-list');
+    const btnCancel = document.getElementById('btn-conflict-cancel');
+    const btnClose = document.getElementById('btn-conflict-close');
+    const btnSkip = document.getElementById('btn-conflict-skip');
+    const btnOverwrite = document.getElementById('btn-conflict-overwrite');
 
-  alertEl.classList.remove('hidden');
-  spinner.classList.remove('hidden');
-  revealBtn.classList.add('hidden');
-  alertText.textContent = `Downloading folder '${folderName}' and all contents from server...`;
+    summaryEl.textContent = `${conflicts.length} item(s) already exist at destination (${directionLabel}). Choose how to proceed:`;
+    btnOverwrite.textContent = conflicts.length === 1 ? 'Overwrite' : 'Overwrite All';
+
+    listEl.innerHTML = '';
+    conflicts.slice(0, 30).forEach(c => {
+      const row = document.createElement('div');
+      row.className = 'sftp-conflict-item';
+      const icon = c.dest_is_dir ? '📁' : '📄';
+      const sizeStr = c.dest_is_dir ? 'Existing folder' : `Existing: ${formatFileSize(c.existing_size)}`;
+      row.innerHTML = `
+        <span class="sftp-conflict-name">${icon} ${escapeHtml(c.name)}</span>
+        <span class="sftp-conflict-meta">${sizeStr}</span>
+      `;
+      listEl.appendChild(row);
+    });
+    if (conflicts.length > 30) {
+      const more = document.createElement('div');
+      more.className = 'sftp-conflict-item';
+      more.innerHTML = `<span class="sftp-conflict-meta">...and ${conflicts.length - 30} more conflicting items</span>`;
+      listEl.appendChild(more);
+    }
+
+    const finish = (choice) => {
+      modal.classList.add('hidden');
+      btnCancel.removeEventListener('click', onCancel);
+      btnClose.removeEventListener('click', onCancel);
+      btnSkip.removeEventListener('click', onSkip);
+      btnOverwrite.removeEventListener('click', onOverwrite);
+      resolve(choice);
+    };
+
+    const onCancel = () => finish('cancel');
+    const onSkip = () => finish('skip');
+    const onOverwrite = () => finish('overwrite');
+
+    btnCancel.addEventListener('click', onCancel);
+    btnClose.addEventListener('click', onCancel);
+    btnSkip.addEventListener('click', onSkip);
+    btnOverwrite.addEventListener('click', onOverwrite);
+
+    modal.classList.remove('hidden');
+  });
+}
+
+// =========================================================
+// Bidirectional Transfers (Local <-> Target & Explorer Drop)
+// =========================================================
+async function transferLocalToRemote(localPaths, targetRemoteDir = currentSftpPath) {
+  if (!currentSftpSessionId || !localPaths || localPaths.length === 0) return;
+  if (isSftpTransferring) {
+    showToast('A transfer is already in progress', 'warning');
+    return;
+  }
+
+  const destDir = targetRemoteDir || currentSftpPath || '/';
+  isSftpTransferring = true;
 
   try {
-    const res = await invokeTauri('sftp_download_dir', {
+    let overwrite = true;
+    const conflicts = await invokeTauri('sftp_check_conflicts', {
       sftpSessionId: currentSftpSessionId,
-      remoteDir: remoteDir,
-      localDir: null
+      localPaths,
+      remoteDir: destDir
     });
 
-    lastDownloadedLocalPath = res.local_dir;
-    spinner.classList.add('hidden');
-    alertText.textContent = `✔ Downloaded folder '${folderName}' (${res.total_files} files, ${formatFileSize(res.total_bytes)}) to ${res.local_dir}`;
-    revealBtn.classList.remove('hidden');
-    showToast(`Folder '${folderName}' downloaded successfully!`, 'success');
+    if (conflicts && conflicts.length > 0) {
+      const choice = await askOverwriteConfirmation(conflicts, `Upload to ${destDir}`);
+      if (choice === 'cancel') return;
+      overwrite = choice === 'overwrite';
+    }
+
+    setSftpTransferAlert('loading', `Uploading ${localPaths.length} item(s) to ${destDir}...`);
+
+    const res = await invokeTauri('sftp_upload_paths', {
+      sftpSessionId: currentSftpSessionId,
+      localPaths,
+      remoteDir: destDir,
+      overwrite
+    });
+
+    const skippedText = res.skipped_items > 0 ? `, skipped ${res.skipped_items}` : '';
+    setSftpTransferAlert('done', `✔ Uploaded ${res.total_files} file(s) (${formatFileSize(res.total_bytes)}${skippedText}) to ${destDir}`);
+    showToast(`Uploaded ${res.total_files} file(s) to Target`, 'success');
+    await sftpLoadDirectory(currentSftpPath, true);
   } catch (err) {
-    spinner.classList.add('hidden');
-    alertText.textContent = `❌ Folder download failed: ${err.message || err}`;
-    showToast(`Folder download failed: ${err.message || err}`, 'error');
+    setSftpTransferAlert('done', `❌ Upload failed: ${err.message || err}`);
+    showToast(`Upload failed: ${err.message || err}`, 'error');
+  } finally {
+    isSftpTransferring = false;
   }
+}
+
+async function transferRemoteToLocal(remoteItems, targetLocalDir = currentLocalPath, options = {}) {
+  if (!currentSftpSessionId || !remoteItems || remoteItems.length === 0) return;
+  if (isSftpTransferring) {
+    showToast('A transfer is already in progress', 'warning');
+    return;
+  }
+
+  const {
+    skipConflictPrompt = false,
+    overwrite: forcedOverwrite = true,
+    excludes = [],
+    autoReconnect = false,
+    isResume = false
+  } = options;
+
+  const destDir = targetLocalDir || currentLocalPath || defaultLocalDownloadDir;
+  isSftpTransferring = true;
+
+  try {
+    let overwrite = forcedOverwrite;
+    if (!skipConflictPrompt) {
+      const conflicts = await invokeTauri('local_check_conflicts', {
+        items: remoteItems,
+        localDir: destDir
+      });
+
+      if (conflicts && conflicts.length > 0) {
+        const choice = await askOverwriteConfirmation(conflicts, `Parallel SFTP to ${destDir} ("Skip Existing" resumes matching files)`);
+        if (choice === 'cancel') return;
+        overwrite = choice === 'overwrite';
+      }
+    }
+
+    lastFailedSftpTransfer = null;
+    const t0 = Date.now();
+    const excludeInfo = excludes.length > 0 ? ` [Excluding ${excludes.length} rule(s)]` : '';
+    const actionLabel = isResume ? '↻ Resuming remaining files via Parallel SFTP' : `Downloading ${remoteItems.length} item(s) via Parallel SFTP`;
+    setSftpTransferAlert('loading', `${actionLabel}${excludeInfo} to ${destDir}...`);
+
+    const runDownload = () => invokeTauri('sftp_download_paths', {
+      sftpSessionId: currentSftpSessionId,
+      items: remoteItems,
+      localDir: destDir,
+      overwrite,
+      excludes
+    });
+
+    let res;
+    try {
+      res = await runDownload();
+    } catch (firstErr) {
+      const msg = String(firstErr?.message || firstErr || '');
+      if (autoReconnect && currentSftpHost && !/cancelled/i.test(msg)) {
+        setSftpTransferAlert('loading', '↻ SFTP session dropped — reconnecting and resuming...');
+        await invokeTauri('sftp_connect', {
+          sftpSessionId: currentSftpSessionId,
+          hostConfig: currentSftpHost
+        });
+        const badge = document.getElementById('sftp-status-badge');
+        if (badge) {
+          badge.className = 'status-badge-small online';
+          badge.style.background = '';
+          badge.style.color = '';
+          badge.textContent = 'Connected';
+        }
+        setSftpTransferAlert('loading', `${actionLabel}${excludeInfo} to ${destDir}...`);
+        res = await runDownload();
+      } else {
+        throw firstErr;
+      }
+    }
+
+    const sec = Math.max(1, Math.round((Date.now() - t0) / 1000));
+    const skippedText = res.skipped_items > 0 ? `, resumed/skipped ${res.skipped_items}` : '';
+    const doneVerb = isResume ? 'Resumed & downloaded' : 'Downloaded';
+    setSftpTransferAlert('done', `✔ ${doneVerb} ${res.total_files} file(s) (${formatFileSize(res.total_bytes)}${skippedText}) in ${sec}s${excludeInfo} to ${destDir}`, destDir);
+    showToast(`${doneVerb} ${res.total_files} file(s) to Local`, 'success');
+    await localLoadDirectory(currentLocalPath, true);
+  } catch (err) {
+    lastFailedSftpTransfer = {
+      items: remoteItems.map(item => ({ ...item })),
+      destDir,
+      excludes: [...excludes]
+    };
+    const errMsg = err.message || err;
+    setSftpTransferAlert('error', `❌ ${isResume ? 'Resume' : 'Download'} stopped: ${errMsg}`, null, true);
+    showToast(`${isResume ? 'Resume' : 'Download'} stopped: ${errMsg}`, 'error');
+    await localLoadDirectory(currentLocalPath, true);
+  } finally {
+    isSftpTransferring = false;
+  }
+}
+
+function resumeFailedSftpTransfer() {
+  if (!lastFailedSftpTransfer) {
+    showToast('No interrupted transfer to resume', 'info');
+    return;
+  }
+  const job = lastFailedSftpTransfer;
+  return transferRemoteToLocal(job.items, job.destDir, {
+    skipConflictPrompt: true,
+    overwrite: false,
+    excludes: job.excludes || [],
+    autoReconnect: true,
+    isResume: true
+  });
+}
+
+// =========================================================
+// Fast Stream Exclude Configuration & Modal
+// =========================================================
+const SFTP_EXCLUDE_STORAGE_KEY = 'rustterm_sftp_stream_excludes';
+const SFTP_EXCLUDE_PRESETS = {
+  nextjs: {
+    checks: ['node_modules', '.next', '.git', '.turbo', '.cache', 'out'],
+    custom: ''
+  },
+  laravel: {
+    checks: ['vendor', 'node_modules', '.git'],
+    custom: 'storage/logs, storage/framework/cache'
+  },
+  python: {
+    checks: ['__pycache__', '.venv', '.git', 'coverage'],
+    custom: 'venv, .pytest_cache, *.pyc'
+  },
+  rust: {
+    checks: ['target', '.git'],
+    custom: ''
+  },
+  clear: {
+    checks: [],
+    custom: ''
+  }
+};
+
+function loadStreamExcludeConfig() {
+  try {
+    const raw = localStorage.getItem(SFTP_EXCLUDE_STORAGE_KEY);
+    if (!raw) return { selectedPresets: [], customRaw: '' };
+    const parsed = JSON.parse(raw);
+    return {
+      selectedPresets: Array.isArray(parsed.selectedPresets) ? parsed.selectedPresets : [],
+      customRaw: typeof parsed.customRaw === 'string' ? parsed.customRaw : ''
+    };
+  } catch (_) {
+    return { selectedPresets: [], customRaw: '' };
+  }
+}
+
+function saveStreamExcludeConfig(cfg) {
+  try {
+    localStorage.setItem(SFTP_EXCLUDE_STORAGE_KEY, JSON.stringify(cfg));
+  } catch (_) {}
+}
+
+function parseCustomExcludes(raw) {
+  if (!raw || typeof raw !== 'string') return [];
+  return raw
+    .split(/[\n,]+/)
+    .map(s => s.trim().replace(/\\/g, '/').replace(/^(\.\/)+/, '').replace(/\/+$/, ''))
+    .filter(Boolean);
+}
+
+function buildCombinedExcludes(selectedPresets, customRaw) {
+  const seen = new Set();
+  const out = [];
+  for (const item of [...(selectedPresets || []), ...parseCustomExcludes(customRaw)]) {
+    const clean = item.trim().replace(/\\/g, '/').replace(/^(\.\/)+/, '').replace(/\/+$/, '');
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      out.push(clean);
+    }
+  }
+  return out;
+}
+
+function getActiveStreamExcludes() {
+  const cfg = loadStreamExcludeConfig();
+  return buildCombinedExcludes(cfg.selectedPresets, cfg.customRaw);
+}
+
+function updateStreamExcludeBadge() {
+  const btn = document.getElementById('sftp-btn-stream-excludes');
+  const label = document.getElementById('sftp-exclude-btn-label');
+  if (!btn || !label) return;
+  const count = getActiveStreamExcludes().length;
+  btn.classList.toggle('active', count > 0);
+  label.textContent = count > 0 ? `Exclude (${count})` : 'Exclude';
+}
+
+function openStreamExcludeModal(pendingStreamItems = null) {
+  const modal = document.getElementById('modal-sftp-stream-exclude');
+  const titleEl = document.getElementById('sftp-exclude-modal-title');
+  const confirmBtn = document.getElementById('btn-exclude-confirm');
+  const cancelBtn = document.getElementById('btn-exclude-cancel');
+  const closeBtn = document.getElementById('btn-exclude-close');
+  const checksGrid = document.getElementById('sftp-exclude-checks-grid');
+  const customInput = document.getElementById('sftp-exclude-custom-input');
+  const previewCount = document.getElementById('sftp-exclude-preview-count');
+  const previewPills = document.getElementById('sftp-exclude-preview-pills');
+
+  const isLaunchingStream = Array.isArray(pendingStreamItems) && pendingStreamItems.length > 0;
+  titleEl.textContent = isLaunchingStream
+    ? `Fast Stream Options (${pendingStreamItems.length} item)`
+    : 'Fast Stream Exclude Filter';
+  confirmBtn.textContent = isLaunchingStream ? '⚡ Save & Start Stream' : 'Save Exclude Rules';
+
+  const cfg = loadStreamExcludeConfig();
+  const checkboxes = Array.from(checksGrid.querySelectorAll('input[type="checkbox"]'));
+  checkboxes.forEach(chk => {
+    chk.checked = cfg.selectedPresets.includes(chk.value);
+  });
+  customInput.value = cfg.customRaw || '';
+
+  const refreshPreview = () => {
+    const selected = checkboxes.filter(c => c.checked).map(c => c.value);
+    const active = buildCombinedExcludes(selected, customInput.value);
+    previewCount.textContent = String(active.length);
+    previewPills.innerHTML = '';
+    if (active.length === 0) {
+      previewPills.innerHTML = '<span style="font-size: 0.74rem; color: var(--text-dim);">No folders excluded (all files will stream)</span>';
+    } else {
+      active.forEach(pat => {
+        const pill = document.createElement('span');
+        pill.className = 'sftp-exclude-pill';
+        pill.textContent = pat;
+        previewPills.appendChild(pill);
+      });
+    }
+  };
+
+  checkboxes.forEach(chk => {
+    chk.onchange = refreshPreview;
+  });
+  customInput.oninput = refreshPreview;
+
+  modal.querySelectorAll('.btn-exclude-preset').forEach(btn => {
+    btn.onclick = () => {
+      const presetKey = btn.dataset.preset;
+      const preset = SFTP_EXCLUDE_PRESETS[presetKey];
+      if (!preset) return;
+      checkboxes.forEach(chk => {
+        chk.checked = preset.checks.includes(chk.value);
+      });
+      customInput.value = preset.custom;
+      refreshPreview();
+    };
+  });
+
+  const closeModal = () => {
+    modal.classList.add('hidden');
+  };
+
+  cancelBtn.onclick = closeModal;
+  closeBtn.onclick = closeModal;
+  confirmBtn.onclick = () => {
+    const selected = checkboxes.filter(c => c.checked).map(c => c.value);
+    saveStreamExcludeConfig({
+      selectedPresets: selected,
+      customRaw: customInput.value
+    });
+    updateStreamExcludeBadge();
+    closeModal();
+    if (isLaunchingStream) {
+      sftpStreamDownload(pendingStreamItems, currentLocalPath);
+    } else {
+      const total = getActiveStreamExcludes().length;
+      showToast(total > 0 ? `Saved ${total} Fast Stream exclude rule(s)` : 'Cleared Fast Stream exclude rules', 'info');
+    }
+  };
+
+  refreshPreview();
+  modal.classList.remove('hidden');
+}
+
+async function sftpStreamDownload(remoteItems, targetLocalDir = currentLocalPath) {
+  if (!currentSftpSessionId || !remoteItems || remoteItems.length === 0) return;
+  if (isSftpTransferring) {
+    showToast('A transfer is already in progress', 'warning');
+    return;
+  }
+
+  const destDir = targetLocalDir || currentLocalPath || defaultLocalDownloadDir;
+  const excludes = getActiveStreamExcludes();
+  isSftpTransferring = true;
+
+  try {
+    let overwrite = true;
+    const conflicts = await invokeTauri('local_check_conflicts', {
+      items: remoteItems,
+      localDir: destDir
+    });
+
+    if (conflicts && conflicts.length > 0) {
+      const choice = await askOverwriteConfirmation(conflicts, `Fast Stream to ${destDir} ("Skip Existing" skips size-matched files)`);
+      if (choice === 'cancel') return;
+      overwrite = choice === 'overwrite';
+    }
+
+    lastFailedSftpTransfer = null;
+    const t0 = Date.now();
+    const excludeInfo = excludes.length > 0 ? ` [Excluding ${excludes.length} rule(s)]` : '';
+    setSftpTransferAlert('loading', `⚡ Starting Fast Stream${excludeInfo} (0 byte server disk) for ${remoteItems.length} item(s) to ${destDir}...`);
+
+    const res = await invokeTauri('sftp_stream_download', {
+      sftpSessionId: currentSftpSessionId,
+      items: remoteItems,
+      localDir: destDir,
+      overwrite,
+      excludes
+    });
+
+    const sec = Math.max(1, Math.round((Date.now() - t0) / 1000));
+    const avgBps = Math.round((res.total_bytes || 0) / sec);
+    const skippedText = res.skipped_items > 0 ? `, skipped ${res.skipped_items}` : '';
+    setSftpTransferAlert('done', `✔ Fast Stream finished: ${res.total_files} file(s) (${formatFileSize(res.total_bytes)}${skippedText}) in ${sec}s (${formatFileSize(avgBps)}/s)${excludeInfo} to ${destDir}`, destDir);
+    showToast(`Fast Stream extracted ${res.total_files} file(s) to Local`, 'success');
+    await localLoadDirectory(currentLocalPath, true);
+  } catch (err) {
+    lastFailedSftpTransfer = {
+      items: remoteItems.map(item => ({ ...item })),
+      destDir,
+      excludes: [...excludes]
+    };
+    setSftpTransferAlert('error', `❌ Fast Stream stopped: ${err.message || err}`, null, true);
+    showToast(`Fast Stream stopped: ${err.message || err}`, 'error');
+    await localLoadDirectory(currentLocalPath, true);
+  } finally {
+    isSftpTransferring = false;
+  }
+}
+
+async function copyExplorerPathsToLocal(sourcePaths, targetLocalDir = currentLocalPath) {
+  if (!sourcePaths || sourcePaths.length === 0) return;
+  const destDir = targetLocalDir || currentLocalPath;
+  if (!destDir) return;
+
+  try {
+    const queryItems = sourcePaths.map(p => {
+      const clean = p.replace(/[\\/]+$/, '');
+      const name = clean.split(/[\\/]/).pop() || clean;
+      return { path: p, name, is_dir: false, size: 0 };
+    });
+
+    let overwrite = true;
+    const conflicts = await invokeTauri('local_check_conflicts', {
+      items: queryItems,
+      localDir: destDir
+    });
+
+    if (conflicts && conflicts.length > 0) {
+      const choice = await askOverwriteConfirmation(conflicts, `Copy to ${destDir}`);
+      if (choice === 'cancel') return;
+      overwrite = choice === 'overwrite';
+    }
+
+    setSftpTransferAlert('loading', `Copying ${sourcePaths.length} item(s) to ${destDir}...`);
+    const res = await invokeTauri('local_copy_paths', {
+      sourcePaths,
+      destDir,
+      overwrite
+    });
+    const skippedText = res.skipped_items > 0 ? `, skipped ${res.skipped_items}` : '';
+    setSftpTransferAlert('done', `✔ Copied ${res.total_files} file(s) (${formatFileSize(res.total_bytes)}${skippedText}) to ${destDir}`, destDir);
+    showToast(`Copied ${res.total_files} file(s) to Local folder`, 'success');
+    await localLoadDirectory(currentLocalPath, true);
+  } catch (err) {
+    setSftpTransferAlert('done', `❌ Local copy failed: ${err.message || err}`);
+    showToast(`Copy failed: ${err.message || err}`, 'error');
+  }
+}
+
+function handleUploadSelectedClick() {
+  const paths = Array.from(selectedLocalPaths);
+  if (paths.length === 0) return;
+  transferLocalToRemote(paths, currentSftpPath);
+}
+
+function handleDownloadSelectedClick() {
+  const items = remoteEntries
+    .filter(e => selectedRemotePaths.has(e.path))
+    .map(e => ({ path: e.path, name: e.name, is_dir: e.is_dir, size: e.size || 0 }));
+  if (items.length === 0) return;
+  transferRemoteToLocal(items, currentLocalPath);
 }
 
 async function handleSftpUploadSelect(e) {
-  const file = e.target.files[0];
-  if (!file || !currentSftpSessionId) return;
-
-  const alertEl = document.getElementById('sftp-transfer-alert');
-  const alertText = document.getElementById('sftp-transfer-text');
-  const spinner = document.getElementById('sftp-transfer-spinner');
-  alertEl.classList.remove('hidden');
-  spinner.classList.remove('hidden');
-  alertText.textContent = `Uploading '${file.name}' to server...`;
+  const files = Array.from(e.target.files || []);
+  if (files.length === 0 || !currentSftpSessionId) return;
 
   try {
-    const localFilePath = file.path || file.name;
-    const res = await invokeTauri('sftp_upload_file', {
-      sftpSessionId: currentSftpSessionId,
-      localPath: localFilePath,
-      remoteDir: currentSftpPath
-    });
+    setSftpTransferAlert('loading', `Uploading ${files.length} selected file(s) to ${currentSftpPath}...`);
+    let totalBytes = 0;
 
-    spinner.classList.add('hidden');
-    alertText.textContent = `✔ Uploaded '${file.name}' (${formatFileSize(res.bytes_transferred)}) to server`;
-    showToast(`Uploaded '${file.name}'`, 'success');
-    await sftpLoadDirectory(currentSftpPath);
+    for (const file of files) {
+      const existing = remoteEntries.find(item => item.name === file.name);
+      if (existing) {
+        const choice = await askOverwriteConfirmation([{
+          name: file.name,
+          source_path: file.name,
+          dest_path: existing.path,
+          source_is_dir: false,
+          dest_is_dir: existing.is_dir,
+          existing_size: existing.size || 0
+        }], `Upload to ${currentSftpPath}`);
+        if (choice === 'cancel') {
+          setSftpTransferAlert('done', 'Upload cancelled');
+          e.target.value = '';
+          return;
+        }
+        if (choice === 'skip') continue;
+      }
+
+      const buf = await file.arrayBuffer();
+      const bytes = Array.from(new Uint8Array(buf));
+      const res = await invokeTauri('sftp_upload_bytes', {
+        sftpSessionId: currentSftpSessionId,
+        fileName: file.name,
+        remoteDir: currentSftpPath,
+        bytes
+      });
+      totalBytes += res.bytes_transferred || bytes.length;
+    }
+
+    setSftpTransferAlert('done', `✔ Uploaded ${files.length} file(s) (${formatFileSize(totalBytes)}) to ${currentSftpPath}`);
+    showToast(`Uploaded ${files.length} file(s)`, 'success');
+    await sftpLoadDirectory(currentSftpPath, true);
   } catch (err) {
-    spinner.classList.add('hidden');
-    alertText.textContent = `❌ Upload failed: ${err.message || err}`;
+    setSftpTransferAlert('done', `❌ Upload failed: ${err.message || err}`);
     showToast(`Upload failed: ${err.message || err}`, 'error');
   }
   e.target.value = '';
 }
 
+// =========================================================
+// Internal Pointer Drag & Drop (Local <-> Target)
+// =========================================================
+function startSftpPointerDrag(e, sourcePane, entry) {
+  const isLocal = sourcePane === 'local';
+  const entries = isLocal ? localEntries : remoteEntries;
+  const set = isLocal ? selectedLocalPaths : selectedRemotePaths;
+
+  let draggedItems;
+  if (set.has(entry.path) && set.size > 1) {
+    draggedItems = entries.filter(item => set.has(item.path));
+  } else {
+    draggedItems = [entry];
+  }
+
+  sftpDragState = {
+    sourcePane,
+    items: draggedItems,
+    startX: e.clientX,
+    startY: e.clientY,
+    active: false,
+    ghostEl: null
+  };
+
+  window.addEventListener('mousemove', handleSftpPointerMove);
+  window.addEventListener('mouseup', handleSftpPointerUp);
+}
+
+function handleSftpPointerMove(e) {
+  if (!sftpDragState) return;
+
+  if (!sftpDragState.active) {
+    const dx = Math.abs(e.clientX - sftpDragState.startX);
+    const dy = Math.abs(e.clientY - sftpDragState.startY);
+    if (dx < 6 && dy < 6) return;
+
+    sftpDragState.active = true;
+    const ghost = document.createElement('div');
+    ghost.className = 'sftp-drag-ghost';
+    const destLabel = sftpDragState.sourcePane === 'local' ? 'Target Server' : 'Local Computer';
+    const count = sftpDragState.items.length;
+    const label = count === 1
+      ? `${getEntryIcon(sftpDragState.items[0].name, sftpDragState.items[0].is_dir)} ${sftpDragState.items[0].name}`
+      : `📦 ${count} items`;
+    ghost.innerHTML = `<span>${escapeHtml(label)}</span><span style="color:#38bdf8;">→ ${destLabel}</span>`;
+    document.body.appendChild(ghost);
+    sftpDragState.ghostEl = ghost;
+  }
+
+  if (sftpDragState.ghostEl) {
+    sftpDragState.ghostEl.style.left = `${e.clientX + 14}px`;
+    sftpDragState.ghostEl.style.top = `${e.clientY + 14}px`;
+  }
+
+  const targetPaneName = sftpDragState.sourcePane === 'local' ? 'remote' : 'local';
+  updateDropTargetHighlightAtPoint(e.clientX, e.clientY, targetPaneName);
+}
+
+function handleSftpPointerUp(e) {
+  window.removeEventListener('mousemove', handleSftpPointerMove);
+  window.removeEventListener('mouseup', handleSftpPointerUp);
+
+  if (!sftpDragState) return;
+  const state = sftpDragState;
+  sftpDragState = null;
+
+  cleanupSftpDragGhost();
+
+  if (!state.active) {
+    clearSftpDropHighlights();
+    return;
+  }
+
+  const targetPaneName = state.sourcePane === 'local' ? 'remote' : 'local';
+  const hit = getDropTargetAtPoint(e.clientX, e.clientY, targetPaneName);
+  clearSftpDropHighlights();
+
+  if (!hit) return;
+
+  if (state.sourcePane === 'local') {
+    const localPaths = state.items.map(i => i.path);
+    transferLocalToRemote(localPaths, hit.folderPath || currentSftpPath);
+  } else {
+    const remoteItems = state.items.map(i => ({ path: i.path, name: i.name, is_dir: i.is_dir, size: i.size || 0 }));
+    transferRemoteToLocal(remoteItems, hit.folderPath || currentLocalPath);
+  }
+}
+
+function cleanupSftpDragGhost() {
+  if (sftpDragState && sftpDragState.ghostEl) {
+    sftpDragState.ghostEl.remove();
+    sftpDragState.ghostEl = null;
+  }
+  document.querySelectorAll('.sftp-drag-ghost').forEach(el => el.remove());
+}
+
+// =========================================================
+// OS Windows Explorer Drag & Drop (via Tauri Webview Event)
+// =========================================================
+function handleOsDragDropEvent(payload) {
+  const modal = document.getElementById('modal-sftp');
+  const conflictModal = document.getElementById('modal-sftp-conflict');
+  if (!modal || modal.classList.contains('hidden')) return;
+  if (conflictModal && !conflictModal.classList.contains('hidden')) return;
+
+  if (!payload || payload.type === 'leave') {
+    clearSftpDropHighlights();
+    return;
+  }
+
+  const dpr = window.devicePixelRatio || 1;
+  const cssX = (payload.position?.x || 0) / dpr;
+  const cssY = (payload.position?.y || 0) / dpr;
+
+  if (payload.type === 'enter' || payload.type === 'over') {
+    updateDropTargetHighlightAtPoint(cssX, cssY, null);
+    return;
+  }
+
+  if (payload.type === 'drop') {
+    const hit = getDropTargetAtPoint(cssX, cssY, null);
+    clearSftpDropHighlights();
+
+    const paths = payload.paths || [];
+    if (paths.length === 0) return;
+
+    if (hit && hit.pane === 'local') {
+      copyExplorerPathsToLocal(paths, hit.folderPath || currentLocalPath);
+    } else if (hit && hit.pane === 'remote') {
+      transferLocalToRemote(paths, hit.folderPath || currentSftpPath);
+    } else {
+      // Fallback: if dropped anywhere inside SFTP modal outside Local pane, upload to Target
+      const els = document.elementsFromPoint(cssX, cssY);
+      if (els.some(el => el.closest('#modal-sftp .modal-content'))) {
+        transferLocalToRemote(paths, currentSftpPath);
+      }
+    }
+  }
+}
+
+function getDropTargetAtPoint(cssX, cssY, allowedPane = null) {
+  const els = document.elementsFromPoint(cssX, cssY);
+  let paneEl = null;
+  let folderRow = null;
+
+  for (const el of els) {
+    if (!folderRow && el.matches && el.matches('tr[data-is-dir="true"]')) {
+      folderRow = el;
+    }
+    if (!folderRow && el.closest) {
+      const tr = el.closest('tr[data-is-dir="true"]');
+      if (tr) folderRow = tr;
+    }
+    if (!paneEl && el.closest) {
+      const p = el.closest('.sftp-pane');
+      if (p) paneEl = p;
+    }
+  }
+
+  if (!paneEl) return null;
+  const paneName = paneEl.dataset.pane;
+  if (allowedPane && paneName !== allowedPane) return null;
+
+  let folderPath = null;
+  if (folderRow && folderRow.dataset.pane === paneName) {
+    folderPath = folderRow.dataset.entryPath;
+  }
+
+  return { pane: paneName, paneEl, folderRow, folderPath };
+}
+
+function updateDropTargetHighlightAtPoint(cssX, cssY, allowedPane = null) {
+  clearSftpDropHighlights();
+  const hit = getDropTargetAtPoint(cssX, cssY, allowedPane);
+  if (!hit) return;
+
+  hit.paneEl.classList.add('sftp-drop-active');
+  if (hit.folderRow) {
+    hit.paneEl.classList.add('has-folder-target');
+    hit.folderRow.classList.add('sftp-drop-folder-target');
+  }
+}
+
+function clearSftpDropHighlights() {
+  document.querySelectorAll('.sftp-pane.sftp-drop-active').forEach(el => {
+    el.classList.remove('sftp-drop-active', 'has-folder-target');
+  });
+  document.querySelectorAll('.sftp-drop-folder-target').forEach(el => {
+    el.classList.remove('sftp-drop-folder-target');
+  });
+}
+
+// =========================================================
+// View / Edit Remote File in Local Editor + Auto-Upload Watch
+// =========================================================
+async function sftpEditRemoteFile(entry) {
+  if (!currentSftpSessionId || !entry || entry.is_dir) return;
+
+  if (entry.size > 20 * 1024 * 1024) {
+    if (!confirm(`'${entry.name}' is ${formatFileSize(entry.size)}. Download and open in your local editor anyway?`)) {
+      return;
+    }
+  }
+
+  try {
+    setSftpTransferAlert('loading', `Opening '${entry.name}' in local editor...`);
+    const watch = await invokeTauri('sftp_edit_remote_file', {
+      sftpSessionId: currentSftpSessionId,
+      remotePath: entry.path
+    });
+
+    if (!activeSftpWatches.some(w => w.watch_id === watch.watch_id)) {
+      activeSftpWatches.push(watch);
+    }
+    renderSftpWatchesBar();
+    setSftpTransferAlert('done', `📝 Editing '${entry.name}' locally — save in your editor to auto-upload to ${entry.path}`);
+    showToast(`Opened '${entry.name}' in default editor (auto-upload on save active)`, 'info');
+  } catch (err) {
+    setSftpTransferAlert('done', `❌ Failed to open '${entry.name}': ${err.message || err}`);
+    showToast(`Failed to open file: ${err.message || err}`, 'error');
+  }
+}
+
+async function refreshSftpWatches() {
+  if (!currentSftpSessionId) return;
+  try {
+    activeSftpWatches = await invokeTauri('sftp_list_watches', { sftpSessionId: currentSftpSessionId }) || [];
+  } catch (_) {}
+}
+
+function renderSftpWatchesBar() {
+  const bar = document.getElementById('sftp-watches-bar');
+  const list = document.getElementById('sftp-watches-list');
+  if (!bar || !list) return;
+
+  if (!activeSftpWatches || activeSftpWatches.length === 0) {
+    bar.classList.add('hidden');
+    list.innerHTML = '';
+    return;
+  }
+
+  bar.classList.remove('hidden');
+  list.innerHTML = '';
+
+  activeSftpWatches.forEach(w => {
+    const pill = document.createElement('div');
+    pill.className = 'sftp-watch-pill';
+    pill.title = `Remote: ${w.remote_path}\nLocal temp: ${w.local_temp_path}`;
+    const countLabel = w.upload_count > 0 ? `(saved ${w.upload_count}x)` : '(watching)';
+    pill.innerHTML = `
+      <span class="sftp-watch-name">${escapeHtml(w.file_name)}</span>
+      <span class="sftp-watch-count">${countLabel}</span>
+      <button class="sftp-watch-btn btn-watch-open" title="Re-open in local editor">Open</button>
+      <button class="sftp-watch-btn stop btn-watch-stop" title="Stop watching & clean temp file">&times;</button>
+    `;
+
+    pill.querySelector('.btn-watch-open').addEventListener('click', async () => {
+      try {
+        await invokeTauri('sftp_reopen_watch', { watchId: w.watch_id });
+      } catch (err) {
+        showToast(`Could not re-open '${w.file_name}': ${err.message || err}`, 'error');
+      }
+    });
+
+    pill.querySelector('.btn-watch-stop').addEventListener('click', async () => {
+      try {
+        await invokeTauri('sftp_stop_watch', { watchId: w.watch_id });
+        activeSftpWatches = activeSftpWatches.filter(item => item.watch_id !== w.watch_id);
+        renderSftpWatchesBar();
+        showToast(`Stopped auto-upload watch for '${w.file_name}'`, 'info');
+      } catch (_) {}
+    });
+
+    list.appendChild(pill);
+  });
+}
+
+// =========================================================
+// Remote Create, Rename, Delete
+// =========================================================
 async function sftpCreateFolder() {
   if (!currentSftpSessionId) return;
   const folderName = prompt('Enter name for new remote directory:');
@@ -2593,9 +3844,27 @@ async function sftpCreateFolder() {
   }
 }
 
+async function sftpRenameEntry(entry) {
+  if (!currentSftpSessionId) return;
+  const newName = prompt(`Rename '${entry.name}' to:`, entry.name);
+  if (!newName || !newName.trim() || newName.trim() === entry.name) return;
+
+  try {
+    await invokeTauri('sftp_rename_item', {
+      sftpSessionId: currentSftpSessionId,
+      oldPath: entry.path,
+      newName: newName.trim()
+    });
+    showToast(`Renamed to '${newName.trim()}'`, 'success');
+    await sftpLoadDirectory(currentSftpPath);
+  } catch (err) {
+    showToast(`Rename failed: ${err.message || err}`, 'error');
+  }
+}
+
 async function sftpDeleteItem(itemPath, isDir, name) {
   if (!currentSftpSessionId) return;
-  const itemType = isDir ? 'directory' : 'file';
+  const itemType = isDir ? 'directory (and all contents inside)' : 'file';
   if (!confirm(`Are you sure you want to delete remote ${itemType} '${name}'?`)) return;
 
   try {
@@ -2609,6 +3878,181 @@ async function sftpDeleteItem(itemPath, isDir, name) {
   } catch (err) {
     showToast(`Delete failed: ${err.message || err}`, 'error');
   }
+}
+
+async function sftpDeleteSelectedRemote() {
+  if (!currentSftpSessionId) return;
+  const items = remoteEntries
+    .filter(e => selectedRemotePaths.has(e.path))
+    .map(e => ({ path: e.path, name: e.name, is_dir: e.is_dir, size: e.size || 0 }));
+  if (items.length === 0) return;
+
+  if (!confirm(`Are you sure you want to delete ${items.length} selected remote item(s)? Directories will be deleted recursively.`)) return;
+
+  try {
+    setSftpTransferAlert('loading', `Deleting ${items.length} remote item(s)...`);
+    const count = await invokeTauri('sftp_delete_items', {
+      sftpSessionId: currentSftpSessionId,
+      items
+    });
+    setSftpTransferAlert('done', `✔ Deleted ${count} remote item(s)`);
+    showToast(`Deleted ${count} remote item(s)`, 'info');
+    await sftpLoadDirectory(currentSftpPath);
+  } catch (err) {
+    setSftpTransferAlert('done', `❌ Delete failed: ${err.message || err}`);
+    showToast(`Batch delete failed: ${err.message || err}`, 'error');
+  }
+}
+
+// =========================================================
+// SFTP Right-Click Context Menu
+// =========================================================
+function openSftpContextMenu(e, pane, entryPath) {
+  closeAllActionMenus();
+  const isLocal = pane === 'local';
+  const entries = isLocal ? localEntries : remoteEntries;
+  const set = isLocal ? selectedLocalPaths : selectedRemotePaths;
+  const entry = entryPath ? entries.find(item => item.path === entryPath) : null;
+
+  if (entry && !set.has(entry.path)) {
+    set.clear();
+    set.add(entry.path);
+    updatePaneSelectionUI(pane);
+  }
+
+  const selectedItems = entries.filter(item => set.has(item.path));
+  const menu = document.createElement('div');
+  menu.className = 'action-submenu-dropdown';
+  menu.id = 'active-sftp-context-menu';
+
+  if (isLocal) {
+    const canUpload = selectedItems.length > 0;
+    const isSingleFile = selectedItems.length === 1 && !selectedItems[0].is_dir;
+    const isSingle = selectedItems.length === 1;
+    menu.innerHTML = `
+      <div class="menu-item-group-title">Local Computer</div>
+      ${canUpload ? `
+        <div class="menu-item" data-action="upload">
+          <div class="menu-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg></div>
+          <div class="menu-text-wrap"><span class="menu-item-text">Upload to Target (${selectedItems.length})</span></div>
+        </div>` : ''}
+      ${isSingleFile ? `
+        <div class="menu-item" data-action="open-local">
+          <div class="menu-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg></div>
+          <div class="menu-text-wrap"><span class="menu-item-text">Open in Default App</span></div>
+        </div>` : ''}
+      <div class="menu-item" data-action="explorer">
+        <div class="menu-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg></div>
+        <div class="menu-text-wrap"><span class="menu-item-text">Open in Explorer</span></div>
+      </div>
+      <div class="menu-divider"></div>
+      <div class="menu-item" data-action="new-folder">
+        <div class="menu-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg></div>
+        <div class="menu-text-wrap"><span class="menu-item-text">New Local Folder</span></div>
+      </div>
+      ${isSingle ? `
+        <div class="menu-item" data-action="rename">
+          <div class="menu-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg></div>
+          <div class="menu-text-wrap"><span class="menu-item-text">Rename</span></div>
+        </div>` : ''}
+      ${selectedItems.length > 0 ? `
+        <div class="menu-item danger" data-action="delete">
+          <div class="menu-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#f43f5e" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></div>
+          <div class="menu-text-wrap"><span class="menu-item-text">Delete (${selectedItems.length})</span></div>
+        </div>` : ''}
+    `;
+  } else {
+    const canDownload = selectedItems.length > 0;
+    const isSingleFile = selectedItems.length === 1 && !selectedItems[0].is_dir;
+    const isSingle = selectedItems.length === 1;
+    const activeExcludes = getActiveStreamExcludes();
+    const excludeHint = activeExcludes.length > 0
+      ? `Excluding ${activeExcludes.length} pattern(s)`
+      : 'SSH tar pipe (all files)';
+    menu.innerHTML = `
+      <div class="menu-item-group-title">Target Server</div>
+      ${isSingleFile ? `
+        <div class="menu-item" data-action="edit">
+          <div class="menu-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg></div>
+          <div class="menu-text-wrap"><span class="menu-item-text">View / Edit (Local Editor)</span><span class="menu-item-hint">Auto-uploads on save</span></div>
+        </div>` : ''}
+      ${canDownload ? `
+        <div class="menu-item" data-action="stream-download">
+          <div class="menu-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fbbf24" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg></div>
+          <div class="menu-text-wrap"><span class="menu-item-text">Fast Stream Download (${selectedItems.length})</span><span class="menu-item-hint">${excludeHint}</span></div>
+        </div>
+        <div class="menu-item" data-action="stream-download-exclude">
+          <div class="menu-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fbbf24" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line></svg></div>
+          <div class="menu-text-wrap"><span class="menu-item-text">Fast Stream with Exclude...</span><span class="menu-item-hint">Pick Next.js / custom exclude rules</span></div>
+        </div>
+        <div class="menu-item" data-action="download">
+          <div class="menu-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg></div>
+          <div class="menu-text-wrap"><span class="menu-item-text">Parallel SFTP Download (${selectedItems.length})</span><span class="menu-item-hint">Supports Smart Resume</span></div>
+        </div>` : ''}
+      <div class="menu-divider"></div>
+      <div class="menu-item" data-action="new-folder">
+        <div class="menu-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg></div>
+        <div class="menu-text-wrap"><span class="menu-item-text">New Remote Folder</span></div>
+      </div>
+      ${isSingle ? `
+        <div class="menu-item" data-action="rename">
+          <div class="menu-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg></div>
+          <div class="menu-text-wrap"><span class="menu-item-text">Rename</span></div>
+        </div>` : ''}
+      ${selectedItems.length > 0 ? `
+        <div class="menu-item danger" data-action="delete">
+          <div class="menu-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#f43f5e" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg></div>
+          <div class="menu-text-wrap"><span class="menu-item-text">Delete (${selectedItems.length})</span></div>
+        </div>` : ''}
+    `;
+  }
+
+  document.body.appendChild(menu);
+  activeActionMenuElement = menu;
+
+  const menuWidth = 240;
+  const menuHeight = 250;
+  let left = e.clientX;
+  let top = e.clientY;
+  if (left + menuWidth > window.innerWidth - 10) left = window.innerWidth - menuWidth - 10;
+  if (top + menuHeight > window.innerHeight - 10) top = Math.max(10, e.clientY - menuHeight);
+
+  menu.style.position = 'fixed';
+  menu.style.top = `${top}px`;
+  menu.style.left = `${left}px`;
+  menu.style.zIndex = '11000';
+
+  menu.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    const item = ev.target.closest('.menu-item');
+    if (!item) return;
+    const action = item.dataset.action;
+    closeAllActionMenus();
+
+    if (isLocal) {
+      if (action === 'upload') transferLocalToRemote(selectedItems.map(i => i.path), currentSftpPath);
+      else if (action === 'open-local') localOpenFile(selectedItems[0]);
+      else if (action === 'explorer') openExplorerToFolder(selectedItems[0]?.path || currentLocalPath);
+      else if (action === 'new-folder') localCreateFolder();
+      else if (action === 'rename') localRenameEntry(selectedItems[0]);
+      else if (action === 'delete') localDeleteSelectedItems();
+    } else {
+      if (action === 'edit') sftpEditRemoteFile(selectedItems[0]);
+      else if (action === 'stream-download') {
+        const items = selectedItems.map(i => ({ path: i.path, name: i.name, is_dir: i.is_dir, size: i.size || 0 }));
+        sftpStreamDownload(items, currentLocalPath);
+      } else if (action === 'stream-download-exclude') {
+        const items = selectedItems.map(i => ({ path: i.path, name: i.name, is_dir: i.is_dir, size: i.size || 0 }));
+        openStreamExcludeModal(items);
+      } else if (action === 'download') handleDownloadSelectedClick();
+      else if (action === 'new-folder') sftpCreateFolder();
+      else if (action === 'rename') sftpRenameEntry(selectedItems[0]);
+      else if (action === 'delete') {
+        if (selectedItems.length === 1) sftpDeleteItem(selectedItems[0].path, selectedItems[0].is_dir, selectedItems[0].name);
+        else sftpDeleteSelectedRemote();
+      }
+    }
+  });
 }
 
 async function openExplorerToFolder(path) {
@@ -2676,6 +4120,29 @@ function mockTauriHandler(cmd, args) {
   if (cmd === 'send_ssh_keepalive') {
     return { success: true };
   }
+  if (cmd === 'local_get_quick_paths') {
+    const transfers = 'C:\\Users\\Demo\\Downloads\\RustTerm_Transfers\\' + (args.hostLabel || 'server');
+    return {
+      drives: ['C:\\', 'D:\\'],
+      home: 'C:\\Users\\Demo',
+      desktop: 'C:\\Users\\Demo\\Desktop',
+      downloads: 'C:\\Users\\Demo\\Downloads',
+      documents: 'C:\\Users\\Demo\\Documents',
+      transfers
+    };
+  }
+  if (cmd === 'local_list_dir') {
+    const p = args.targetPath || 'C:\\Users\\Demo\\Downloads';
+    return {
+      current_path: p,
+      parent_path: p === 'C:\\' ? null : 'C:\\Users\\Demo',
+      entries: [
+        { name: 'dist', path: p + '\\dist', is_dir: true, is_file: false, size: 0, modified: Math.floor(Date.now() / 1000) - 3000 },
+        { name: 'config.local.json', path: p + '\\config.local.json', is_dir: false, is_file: true, size: 1520, modified: Math.floor(Date.now() / 1000) - 900 },
+        { name: 'README.txt', path: p + '\\README.txt', is_dir: false, is_file: true, size: 420, modified: Math.floor(Date.now() / 1000) - 12000 }
+      ]
+    };
+  }
   if (cmd === 'sftp_get_default_transfers_dir') {
     return '~/Downloads/RustTerm_Transfers/' + (args.hostLabel || 'server');
   }
@@ -2696,6 +4163,26 @@ function mockTauriHandler(cmd, args) {
       ]
     };
   }
+  if (cmd === 'sftp_check_conflicts' || cmd === 'local_check_conflicts') {
+    return [];
+  }
+  if (cmd === 'sftp_upload_paths' || cmd === 'sftp_download_paths' || cmd === 'sftp_stream_download' || cmd === 'local_copy_paths') {
+    return { total_files: 12, total_bytes: 2048000, skipped_items: 0 };
+  }
+  if (cmd === 'sftp_cancel_transfer') {
+    return true;
+  }
+  if (cmd === 'sftp_edit_remote_file') {
+    return {
+      watch_id: 'mock-watch-' + Date.now(),
+      sftp_session_id: args.sftpSessionId,
+      remote_path: args.remotePath,
+      file_name: args.remotePath.split('/').pop(),
+      local_temp_path: 'C:\\Temp\\' + args.remotePath.split('/').pop(),
+      upload_count: 0,
+      last_upload_at: 0
+    };
+  }
   if (cmd === 'sftp_download_file') {
     return {
       local_path: '~/Downloads/RustTerm_Transfers/' + args.remotePath.split('/').pop(),
@@ -2709,17 +4196,20 @@ function mockTauriHandler(cmd, args) {
       total_bytes: 42500000
     };
   }
-  if (cmd === 'sftp_upload_file') {
+  if (cmd === 'sftp_upload_file' || cmd === 'sftp_upload_bytes') {
     return {
-      remote_path: args.remoteDir + '/uploaded_file',
-      bytes_transferred: 51200
+      remote_path: args.remoteDir + '/' + (args.fileName || 'uploaded_file'),
+      bytes_transferred: args.bytes ? args.bytes.length : 51200
     };
   }
   if (cmd === 'save_backup_file') {
     return '~/Downloads/RustTerm_Backups/rustterm_backup_' + new Date().toISOString().slice(0, 10) + '.json';
   }
-  if (cmd === 'sftp_create_dir' || cmd === 'sftp_delete_item' || cmd === 'sftp_open_in_explorer') {
-    return true;
+  if (cmd === 'sftp_delete_items' || cmd === 'local_delete_items') {
+    return args.items ? args.items.length : (args.paths ? args.paths.length : 1);
+  }
+  if (cmd === 'sftp_list_watches') {
+    return activeSftpWatches;
   }
   return { ok: true };
 }
